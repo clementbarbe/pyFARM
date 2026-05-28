@@ -1,0 +1,8 @@
+# Ignorer tous les dossiers commençant par un point
+.*/
+
+# Ignorer les dossiers __pycache__ (Python)
+__pycache__/
+
+# Ignorer tout le contenu du dossier output/
+output/

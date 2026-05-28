@@ -1,7 +1,14 @@
-"""Per-step segment diagnostics (carpet + mean ± std + histogram)."""
+"""Per-step segment diagnostics (carpet + mean ± std + histogram).
+
+Saves figures to disk, never calls ``plt.show()``.
+"""
+
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+from farm.visualization.plotting import savefig
 
 
 def diagnose_segments(
@@ -10,11 +17,13 @@ def diagnose_segments(
     seg_len: int,
     ch_name: str,
     stage: str,
+    fig_dir: Path | None,
     n_show: int = 200,
 ) -> None:
     """Visualise the first *n_show* segments at a given pipeline stage.
 
-    Displays: carpet plot, mean ± std, amplitude histogram.
+    Writes a single ``.png`` with three sub-panels: carpet, mean ± std,
+    amplitude histogram.
     """
     rows = []
     for idx in range(min(n_show, len(onsets))):
@@ -29,7 +38,8 @@ def diagnose_segments(
     vmax = np.percentile(np.abs(carpet), 99)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 4))
-    axes[0].imshow(carpet, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    axes[0].imshow(carpet, aspect="auto", cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax)
     axes[0].set_title(f"Carpet — {ch_name} — {stage}")
     axes[0].set_xlabel("Sample"); axes[0].set_ylabel("Segment #")
 
@@ -47,4 +57,5 @@ def diagnose_segments(
     axes[2].set_title("Amplitude distribution"); axes[2].set_xlabel("Amplitude")
 
     fig.tight_layout()
-    plt.show()
+    safe_stage = stage.replace(" ", "_").replace("(", "").replace(")", "")
+    savefig(fig, fig_dir, f"{ch_name}_diag_{safe_stage}")

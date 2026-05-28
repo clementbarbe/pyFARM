@@ -1,21 +1,22 @@
 """Carpet (image) plots of stacked slice segments."""
 
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
+
+from .plotting import savefig
 
 
 def plot_carpet(
     segments: np.ndarray,
+    fig_dir: Path | None,
+    name: str = "carpet",
     title: str = "Carpet",
     xlabel: str = "Sample",
     ylabel: str = "Segment #",
 ) -> None:
-    """Display a carpet plot from a 2-D segment array.
-
-    Parameters
-    ----------
-    segments : ndarray, shape ``(n_segments, seg_len)``.
-    """
+    """Display a carpet plot from a 2-D segment array."""
     if segments.size == 0:
         return
     vmax = np.percentile(np.abs(segments), 99)
@@ -24,7 +25,7 @@ def plot_carpet(
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
     ax.set_title(title)
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, name)
 
 
 def plot_carpet_comparison(
@@ -36,13 +37,17 @@ def plot_carpet_comparison(
     sdur: float,
     n_sg: int,
     n_vol: int,
+    fig_dir: Path | None,
     bandpass: tuple | None = None,
 ) -> None:
     """Before/after carpet plots using band-passed data."""
     from farm.preprocessing.filters import apply_bandpass
 
     seg_len = int(round(sdur * srate))
-    for stage, arr in [("BEFORE (HPF)", data_before), ("AFTER FARM", data_after)]:
+    for stage, arr, suffix in [
+        ("BEFORE (HPF)", data_before, "before"),
+        ("AFTER FARM", data_after, "after"),
+    ]:
         ts = apply_bandpass(arr, srate, bandpass) if bandpass else arr
         rows = []
         for v in range(n_vol):
@@ -54,5 +59,7 @@ def plot_carpet_comparison(
         if rows:
             plot_carpet(
                 np.array(rows),
+                fig_dir,
+                name=f"{ch_name}_carpet_{suffix}",
                 title=f"Carpet — {ch_name} — {stage}",
             )

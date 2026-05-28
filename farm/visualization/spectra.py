@@ -1,8 +1,15 @@
-"""Frequency-domain visualisations: PSD, FFT power, spectrograms."""
+"""Frequency-domain visualisations: PSD, FFT power, spectrograms.
+
+All functions write to ``fig_dir`` and never call ``plt.show()``.
+"""
+
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal as sig
+
+from .plotting import savefig
 
 
 def plot_psd_comparison(
@@ -10,6 +17,7 @@ def plot_psd_comparison(
     data_after: np.ndarray,
     srate: float,
     ch_name: str,
+    fig_dir: Path | None,
     title_before: str = "Before",
     title_after: str = "After",
     xlim: float = 375.0,
@@ -31,13 +39,14 @@ def plot_psd_comparison(
         ax.axvline(30, color="gray", ls="--", alpha=0.5, label="30 Hz")
         ax.legend()
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_psd_comparison")
 
 
 def plot_fft_power(
     data_clean: np.ndarray,
     srate: float,
     ch_name: str,
+    fig_dir: Path | None,
     xlim: float = 375.0,
 ) -> None:
     """FFT power (linear + dB) of the cleaned signal."""
@@ -59,7 +68,7 @@ def plot_fft_power(
     axes[1].set_title(f"FFT Power (dB) — {ch_name}")
     axes[1].set_xlim([0, xlim])
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_fft_power")
 
 
 def plot_fft_before_after(
@@ -67,16 +76,19 @@ def plot_fft_before_after(
     ts_after: np.ndarray,
     srate: float,
     ch_name: str,
+    fig_dir: Path | None,
     sdur: float = 0.0,
     xlim: float = 375.0,
 ) -> None:
     """FFT dB plots: separate panels then overlay."""
     N = len(ts_before)
     freqs = np.fft.rfftfreq(N, d=1.0 / srate)
-    db_b = 20 * np.log10(np.abs(np.fft.rfft(ts_before.astype(np.float64))) / N + 1e-20)
-    db_a = 20 * np.log10(np.abs(np.fft.rfft(ts_after.astype(np.float64))) / N + 1e-20)
+    db_b = 20 * np.log10(
+        np.abs(np.fft.rfft(ts_before.astype(np.float64))) / N + 1e-20)
+    db_a = 20 * np.log10(
+        np.abs(np.fft.rfft(ts_after.astype(np.float64))) / N + 1e-20)
 
-    # Separate panels
+    # ── Separate panels ──
     fig, axes = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
     for ax, label, db, color in zip(
         axes,
@@ -97,9 +109,9 @@ def plot_fft_before_after(
     axes[1].set_xlabel("Hz")
     fig.suptitle(f"FFT before/after — {ch_name}", fontsize=13, fontweight="bold")
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_fft_before_after")
 
-    # Overlay
+    # ── Overlay ──
     fig, ax = plt.subplots(figsize=(16, 5))
     ax.plot(freqs, db_b, color="#d62728", lw=0.3, alpha=0.5, label="Before")
     ax.plot(freqs, db_a, color="#2ca02c", lw=0.3, alpha=0.8, label="After FARM")
@@ -107,7 +119,7 @@ def plot_fft_before_after(
     ax.set_title(f"FFT overlay — {ch_name}"); ax.legend()
     ax.set_xlim([0, xlim])
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_fft_overlay")
 
 
 def plot_psd_welch_before_after(
@@ -115,11 +127,14 @@ def plot_psd_welch_before_after(
     ts_after: np.ndarray,
     srate: float,
     ch_name: str,
+    fig_dir: Path | None,
     xlim: float = 375.0,
 ) -> None:
     """Welch PSD overlay before/after."""
-    f_w, p_b = sig.welch(ts_before, srate, nperseg=min(4096, len(ts_before) // 4))
-    _, p_a = sig.welch(ts_after, srate, nperseg=min(4096, len(ts_after) // 4))
+    f_w, p_b = sig.welch(ts_before, srate,
+                          nperseg=min(4096, len(ts_before) // 4))
+    _, p_a = sig.welch(ts_after, srate,
+                        nperseg=min(4096, len(ts_after) // 4))
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.semilogy(f_w, p_b, alpha=0.6, label="Before")
     ax.semilogy(f_w, p_a, alpha=0.8, label="After FARM")
@@ -127,7 +142,7 @@ def plot_psd_welch_before_after(
     ax.set_title(f"PSD Welch before/after — {ch_name}"); ax.legend()
     ax.set_xlim([0, xlim])
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_psd_welch_before_after")
 
 
 def plot_spectrogram_comparison(
@@ -135,6 +150,7 @@ def plot_spectrogram_comparison(
     data_after: np.ndarray,
     srate: float,
     ch_name: str,
+    fig_dir: Path | None,
     ylim: float = 500.0,
 ) -> None:
     """Side-by-side spectrograms before/after."""
@@ -154,4 +170,4 @@ def plot_spectrogram_comparison(
         plt.colorbar(im, ax=ax, label="dB")
     axes[1].set_xlabel("Time (s)")
     fig.tight_layout()
-    plt.show()
+    savefig(fig, fig_dir, f"{ch_name}_spectrogram_comparison")

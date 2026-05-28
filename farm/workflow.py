@@ -3,6 +3,9 @@ farm pipeline orchestrator.
 
 Calls each processing brick in the correct order.
 Contains no complex scientific logic — only sequencing and data routing.
+
+All diagnostic figures are saved as ``.png`` files to the configured
+``figures_dir``.  No interactive ``plt.show()`` is ever called.
 """
 
 import logging
@@ -36,7 +39,7 @@ from farm.templates.subtraction import build_artifact_templates
 from farm.templates.zerofill import zero_fill_dtime
 from farm.pca.cleanup import pca_cleanup
 
-# ── Diagnostics & visualisation ──
+# ── Diagnostics ──
 from farm.diagnostics.segments import diagnose_segments
 from farm.diagnostics.metrics import compute_rms_reduction
 
@@ -64,11 +67,9 @@ def _correct_channel(
     cfg: FARMConfig,
     srate_up: float,
     ch_name: str = "",
+    fig_dir: Path | None = None,
 ) -> np.ndarray:
-    """Run FARM steps (iii)–(vi) on a single upsampled channel.
-
-    Returns the cleaned 1-D signal (float32).
-    """
+    """Run FARM steps (iii)–(vi) on a single upsampled channel."""
     signal = ch_signal.copy()
 
     # ── (iii) Phase alignment ────────────────────────────────
@@ -80,9 +81,9 @@ def _correct_channel(
         return signal
     signal = overwrite_segments(signal, onsets_up, aligned_segs, valid_idx)
 
-    if cfg.plot:
+    if fig_dir is not None:
         diagnose_segments(signal, onsets_up, seg_len, ch_name,
-                          "After (iii) phase-shift")
+                          "After (iii) phase-shift", fig_dir)
 
     # ── (v) Template subtraction ─────────────────────────────
     artifact_segs = build_artifact_templates(
@@ -93,11 +94,12 @@ def _correct_channel(
         signal.copy(), onsets_up, artifact_segs, valid_idx,
     )
 
-    if cfg.plot:
+    if fig_dir is not None:
         sub_diag = signal.copy()
-        sub_diag[scan_start_up:scan_stop_up] -= artifact_signal[scan_start_up:scan_stop_up]
+        sub_diag[scan_start_up:scan_stop_up] -= (
+            artifact_signal[scan_start_up:scan_stop_up])
         diagnose_segments(sub_diag, onsets_up, seg_len, ch_name,
-                          "After (v) templates")
+                          "After (v) templates", fig_dir)
         del sub_diag
 
     # ── (iv) Zero-fill dtime ─────────────────────────────────
@@ -110,9 +112,9 @@ def _correct_channel(
         seg_len, dtime_samp_up,
     )
 
-    if cfg.plot:
+    if fig_dir is not None:
         diagnose_segments(signal_zf, onsets_up, seg_len, ch_name,
-                          "After (iv) zero-fill")
+                          "After (iv) zero-fill", fig_dir)
 
     # ── (vi) PCA cleanup ─────────────────────────────────────
     clean = pca_cleanup(
@@ -123,9 +125,9 @@ def _correct_channel(
         var_threshold=cfg.var_threshold,
     )
 
-    if cfg.plot:
+    if fig_dir is not None:
         diagnose_segments(clean, onsets_up, seg_len, ch_name,
-                          "After (vi) PCA")
+                          "After (vi) PCA", fig_dir)
 
     return clean.astype(np.float32)
 
@@ -148,18 +150,18 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         ``data_clean_full``, ``data_clean_crop``, ``data_hpf``,
         ``data_raw_trim``, ``data_full_raw``, ``ch_names``, ``ch_indices``,
         ``srate``, ``sdur``, ``dtime``, ``vol_onsets``, ``vol_onsets_abs``,
-        ``s_trim``, ``e_trim``, ``n_vol``, ``raw_original``.
+        ``s_trim``, ``e_trim``, ``n_vol``, ``raw_original``,
+        ``rms_results``, ``regressors``, ``figures_dir``.
     """
     cfg.validate()
     t_total = time.time()
     basename = Path(cfg.vhdr_path).stem + "_FARM"
 
-    if cfg.plot:
-        import matplotlib.pyplot as plt
-        plt.rcParams.update({
-            "figure.figsize": (14, 5), "figure.dpi": 100,
-            "axes.grid": True, "grid.alpha": 0.3, "font.size": 10,
-        })
+    # Resolve figure output directory (None = disabled)
+    fig_dir: Path | None = None
+    if cfg.figures_enabled:
+        fig_dir = cfg.get_figures_dir()
+        logger.info("Figures will be saved to: %s", fig_dir)
 
     # ────────────────────────────────────────────────────────
     # 1. Load BrainVision data
@@ -176,9 +178,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     vol_onsets, n_vol, ivi_stats = detect_volume_onsets(
         raw, cfg.trigger, cfg.tr, cfg.n_volumes,
     )
-    if cfg.plot:
+    if fig_dir is not None:
         from farm.visualization.timeseries import plot_ivi
-        plot_ivi(ivi_stats, cfg.tr)
+        plot_ivi(ivi_stats, cfg.tr, fig_dir)
 
     # ────────────────────────────────────────────────────────
     # 3. Select EMG channels
@@ -189,9 +191,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     n_samples_full = data.shape[1]
     n_ch = data.shape[0]
 
-    if cfg.plot:
+    if fig_dir is not None:
         from farm.visualization.timeseries import plot_raw_channels
-        plot_raw_channels(data, ch_names, srate, vol_onsets)
+        plot_raw_channels(data, ch_names, srate, vol_onsets, fig_dir)
 
     # ────────────────────────────────────────────────────────
     # 4. Trim to scan boundaries
@@ -213,10 +215,10 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     data_hpf = data.copy()
     logger.info("HPF done in %.2f s", time.time() - t0)
 
-    if cfg.plot:
+    if fig_dir is not None:
         from farm.visualization.spectra import plot_psd_comparison
         plot_psd_comparison(
-            data_before_hpf[0], data[0], srate, ch_names[0],
+            data_before_hpf[0], data[0], srate, ch_names[0], fig_dir,
             "Before HPF", "After HPF 30 Hz",
         )
     del data_before_hpf
@@ -284,9 +286,10 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         n_total, seg_len, len(slice_info["good_slice_idx"]),
     )
 
-    if cfg.plot:
+    if fig_dir is not None:
         from farm.visualization.timeseries import plot_slice_marker_diagnostics
-        plot_slice_marker_diagnostics(onsets_up, round_errors, seg_len, cfg.n_sg)
+        plot_slice_marker_diagnostics(
+            onsets_up, round_errors, seg_len, cfg.n_sg, fig_dir)
 
     # ────────────────────────────────────────────────────────
     # 11. Per-channel FARM correction
@@ -303,15 +306,18 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             data_up[ch], onsets_up, round_errors, seg_len,
             slice_info, scan_start_up, scan_stop_up,
             dtime_samp_up, cfg, srate_up, ch_names[ch],
+            fig_dir=fig_dir,
         )
-        logger.info("Channel %s done in %.2f s", ch_names[ch], time.time() - t0)
+        logger.info("Channel %s done in %.2f s",
+                     ch_names[ch], time.time() - t0)
 
     # ────────────────────────────────────────────────────────
     # 12. Downsample + LPF
     # ────────────────────────────────────────────────────────
     banner("POST-PROCESSING", "📉")
     t0 = time.time()
-    data_clean_crop = downsample(data_up, srate_up, cfg.interp_factor, n_samples_orig)
+    data_clean_crop = downsample(
+        data_up, srate_up, cfg.interp_factor, n_samples_orig)
     del data_up
     data_clean_crop = lpf_butter(data_clean_crop, srate, cfg.lpf_cutoff)
 
@@ -328,7 +334,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         data_hpf, data_clean_crop, srate, ch_names, cfg.bandpass,
     )
 
-    if cfg.plot:
+    if fig_dir is not None:
         from farm.visualization.spectra import (
             plot_fft_power, plot_fft_before_after,
             plot_psd_welch_before_after, plot_spectrogram_comparison,
@@ -340,26 +346,24 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
         for ch_i in range(n_ch):
             name = ch_names[ch_i]
-            plot_fft_power(data_clean_crop[ch_i], srate, name)
+            plot_fft_power(data_clean_crop[ch_i], srate, name, fig_dir)
 
             ts_b = apply_bandpass(data_hpf[ch_i], srate, cfg.bandpass)
             ts_a = apply_bandpass(data_clean_crop[ch_i], srate, cfg.bandpass)
-            plot_fft_before_after(ts_b, ts_a, srate, name, sdur)
-            plot_psd_welch_before_after(ts_b, ts_a, srate, name)
+            plot_fft_before_after(ts_b, ts_a, srate, name, fig_dir, sdur)
+            plot_psd_welch_before_after(ts_b, ts_a, srate, name, fig_dir)
             plot_spectrogram_comparison(
-                data_hpf[ch_i], data_clean_crop[ch_i], srate, name,
-            )
+                data_hpf[ch_i], data_clean_crop[ch_i], srate, name, fig_dir)
             plot_session_comparison(
-                data_hpf[ch_i], data_clean_crop[ch_i], srate, name, cfg.bandpass,
-            )
+                data_hpf[ch_i], data_clean_crop[ch_i], srate, name,
+                fig_dir, cfg.bandpass)
             plot_carpet_comparison(
                 data_hpf[ch_i], data_clean_crop[ch_i],
-                srate, name, vol_onsets, sdur, cfg.n_sg, n_vol, cfg.bandpass,
-            )
+                srate, name, vol_onsets, sdur, cfg.n_sg, n_vol,
+                fig_dir, cfg.bandpass)
             plot_full_signal_overview(
                 data_full_raw[ch_i], data_clean_full[ch_i],
-                srate, name, s_trim, e_trim,
-            )
+                srate, name, s_trim, e_trim, fig_dir)
 
     # ────────────────────────────────────────────────────────
     # 14. Export
@@ -418,6 +422,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         ("TR", f"{(cfg.n_sg * sdur + dtime) * 1e3:.4f} ms"),
         ("Total time", f"{time.time() - t_total:.1f} s"),
         ("Output", str(Path(cfg.output_dir).resolve())),
+        ("Figures", str(fig_dir) if fig_dir else "disabled"),
     ])
     ok("Pipeline complete.")
 
@@ -440,4 +445,5 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "raw_original": raw_original,
         "rms_results": rms_results,
         "regressors": all_regressors,
+        "figures_dir": fig_dir,
     }

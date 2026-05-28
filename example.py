@@ -1,11 +1,12 @@
 """
-farm — Minimal usage example.
+FARM — Minimal usage example.
 
 Adjust the parameters below to match your acquisition, then run:
     python example.py
 """
 
-import logging, sys
+import logging
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,10 +26,12 @@ cfg = FARMConfig(
     trigger="R128",
     ch_regex=r"EXT|FLE",
     output_dir="output",
-    plot=True,
+    # figures_dir=None means figures go to output/figures/
+    # figures_dir="" disables figures entirely
 )
 
 results = run_pipeline(cfg)
 print(f"\nCleaned data shape : {results['data_clean_full'].shape}")
 print(f"Optimised sdur     : {results['sdur']*1e3:.4f} ms")
 print(f"Optimised dtime    : {results['dtime']*1e3:.4f} ms")
+print(f"Figures saved to   : {results['figures_dir']}")

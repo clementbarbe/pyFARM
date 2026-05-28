@@ -1,6 +1,7 @@
 """Pipeline configuration dataclass."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 
@@ -44,8 +45,10 @@ class FARMConfig:
         Extra samples on each side for FFT phase-shift extraction.
     output_dir : str
         Directory where all outputs are written.
-    plot : bool
-        If *True*, produce diagnostic plots during the pipeline.
+    figures_dir : str or None
+        Directory for diagnostic ``.png`` figures.
+        If *None*, defaults to ``<output_dir>/figures``.
+        Set to empty string ``""`` to disable figure generation entirely.
     """
 
     # ── Input ────────────────────────────────────────────────
@@ -71,14 +74,28 @@ class FARMConfig:
     padding: int = 10
 
     # ── Output ───────────────────────────────────────────────
-    output_dir: str = "FARM_output"
-    plot: bool = True
+    output_dir: str = "output"
+    figures_dir: Optional[str] = None
 
     # ── Derived ──────────────────────────────────────────────
     @property
     def n_sg(self) -> int:
         """Number of slice-artifact groups per volume."""
         return self.n_slices // self.mb_factor
+
+    @property
+    def figures_enabled(self) -> bool:
+        """Whether diagnostic figures should be generated."""
+        return self.figures_dir != ""
+
+    def get_figures_dir(self) -> Path:
+        """Resolved figures directory, created on first call."""
+        if self.figures_dir is None:
+            p = Path(self.output_dir) / "figures"
+        else:
+            p = Path(self.figures_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
     def validate(self) -> None:
         """Raise if the configuration is inconsistent."""

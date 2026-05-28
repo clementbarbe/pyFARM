@@ -55,7 +55,7 @@ results = run_pipeline(cfg)
 
 ## Output
 
-All outputs are written to FARM_output/ (configurable):
+All outputs are written to output/ (configurable):
 
     .vhdr/.eeg/.vmrk — Full-length BrainVision with all original markers preserved
     .npz / .mat — Cleaned arrays + metadata

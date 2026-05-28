@@ -12,9 +12,9 @@ pip install numpy scipy mne matplotlib
 ```
 ## Quick Start
 
-bash
+```bash
 python run.py path/to/data.vhdr --tr 1.6 --n-slices 54 --mb-factor 3
-
+```
 Or programmatically:
 
 ```python

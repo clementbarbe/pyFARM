@@ -1,4 +1,4 @@
-# FARMICHE — FARM EMG-fMRI Denoising Pipeline
+# PYTHON FARM EMG-fMRI Denoising Pipeline
 
 Python implementation of the **FARM** (fMRI Artifact Reduction for EMG) pipeline
 for removing gradient artifacts from EMG signals recorded simultaneously with fMRI.

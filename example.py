@@ -24,7 +24,7 @@ cfg = FARMConfig(
     mb_factor=3,
     trigger="R128",
     ch_regex=r"EXT|FLE",
-    output_dir="FARM_output",
+    output_dir="output",
     plot=True,
 )
 

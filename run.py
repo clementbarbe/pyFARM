@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument("--mb-factor", type=int, default=1, help="Multiband factor (default 1)")
     p.add_argument("--trigger", default="R128", help="Volume trigger label (default R128)")
     p.add_argument("--ch-regex", default=r"EXT|FLE", help="Regex for EMG channel names")
-    p.add_argument("--output-dir", default="FARM_output", help="Output directory")
+    p.add_argument("--output-dir", default="output", help="Output directory")
     p.add_argument("--interp-factor", type=int, default=10, help="Upsampling factor")
     p.add_argument("--window-size", type=int, default=50, help="Template candidate window")
     p.add_argument("--n-candidates", type=int, default=12, help="Template candidates kept")

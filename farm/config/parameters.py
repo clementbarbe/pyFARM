@@ -100,9 +100,10 @@ class FARMConfig:
 
     # ── HRF centering ────────────────────────────────────────
     center_hrf: bool = True
+    center_hrf_percentile: float = 10.0
 
     # ── Output ───────────────────────────────────────────────
-    output_dir: str = "FARM_output"
+    output_dir: str = "output"
     figures_dir: Optional[str] = None
 
     # ── Derived ──────────────────────────────────────────────

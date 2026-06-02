@@ -34,6 +34,8 @@ def parse_args():
     p.add_argument("--no-center-hrf", action="store_true",
                     help="Disable HRF baseline centering (use legacy [0,1] "
                          "normalisation instead)")
+    p.add_argument("--center-hrf-percentile", type=float, default=10.0,
+                    help="Percentile for HRF baseline estimation (default 10)")
     p.add_argument("--output-dir", default="output",
                     help="Output directory")
     p.add_argument("--figures-dir", default=None,
@@ -97,8 +99,9 @@ def main():
         output_dir=args.output_dir,
         figures_dir=figures_dir,
         interp_factor=args.interp_factor,
-        window_size=args.window_size,
         center_hrf=not args.no_center_hrf,
+        center_hrf_percentile=args.center_hrf_percentile,
+        window_size=args.window_size,
         n_candidates=args.n_candidates,
         n_volumes=args.n_volumes,
         time_section=args.time_section,

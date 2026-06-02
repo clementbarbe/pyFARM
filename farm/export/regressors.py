@@ -5,13 +5,11 @@ Reproduces the logic of ``farm_emg_regressor`` / ``farm_make_regressor``:
 
     Bandpass → Hilbert envelope → Normalize [0,1]
     → Baseline correction → ↓ 1000 Hz
-    → HRF convolution → **center using quiet periods** → derivatives → ↓ TR
+    → HRF convolution → **center at baseline** → derivatives + log → ↓ TR
 
-When ``center_hrf=True``, quiet periods are identified from the
-envelope (where it is zero after baseline correction).  The median
-convolution value during those quiet periods defines the true
-baseline and is subtracted.  The HRF undershoot is preserved as
-negative values.  Derivatives are computed on this centered signal.
+When ``center_hrf=True``, the HRF-convolved signals are centered so that
+quiet periods sit at zero.  The HRF undershoot is preserved as negative
+values.  Derivatives are computed on the centered signal.
 """
 
 import logging
@@ -44,76 +42,42 @@ def _normalize_range(x: np.ndarray) -> np.ndarray:
     return np.zeros_like(x) if mx - mn < 1e-30 else (x - mn) / (mx - mn)
 
 
-def _log_transform(x: np.ndarray) -> np.ndarray:
-    """``log(x - min(x) + 1)``."""
-    x = np.asarray(x, dtype=np.float64)
-    return np.log(x - x.min() + 1.0)
-
-
-def _center_at_quiet(
-    convolved: np.ndarray,
-    envelope: np.ndarray,
-    quiet_threshold: float = 0.01,
+def _center_and_scale(
+    x: np.ndarray, baseline_percentile: float = 10.0,
 ) -> np.ndarray:
-    """Center a convolved signal so that baseline = 0, peak = 1.
+    """Center so that baseline = 0, scale so that peak = 1.
 
-    The baseline is measured as the **median convolution value during
-    quiet periods** (where the source envelope is near zero).
+    Negative values (HRF undershoot) are **preserved**.
 
-    This is far more robust than a global percentile on the convolved
-    signal, which can accidentally pick up the HRF undershoot
-    (which is *below* the true baseline).
+    The baseline is estimated as a low percentile of the signal,
+    which is robust even if the recording starts with an active
+    period — the percentile will find quiet periods elsewhere.
 
     Parameters
     ----------
-    convolved : 1-D array — raw HRF-convolved signal.
-    envelope : 1-D array — the input envelope (same length).
-        Quiet periods are identified as ``envelope < quiet_threshold``.
-    quiet_threshold : float — values of *envelope* below this are
-        considered quiet (default 0.01).  With the ``"robust"``
-        baseline correction, quiet samples are exactly 0.
+    x : 1-D array — raw convolved signal.
+    baseline_percentile : float — percentile used to estimate the
+        resting level (default 10).
 
     Returns
     -------
-    1-D float64 array.  Baseline ≈ 0, peak = 1, undershoot < 0.
+    1-D float64 array.  Baseline ≈ 0, peak ≈ 1, undershoot < 0.
     """
-    convolved = np.asarray(convolved, dtype=np.float64)
-    envelope = np.asarray(envelope, dtype=np.float64)
-
-    quiet_mask = envelope < quiet_threshold
-    n_quiet = int(np.sum(quiet_mask))
-
-    if n_quiet >= 10:
-        # Enough quiet samples — use their median as baseline
-        baseline = float(np.median(convolved[quiet_mask]))
-    else:
-        # Fallback: very few quiet samples (unlikely with robust correction)
-        # Use the 5th percentile as a conservative estimate
-        baseline = float(np.percentile(convolved, 5))
-        logger.warning(
-            "Only %d quiet samples found (threshold=%.3f) — "
-            "using 5th percentile fallback for HRF baseline.",
-            n_quiet, quiet_threshold,
-        )
-
-    centered = convolved - baseline
+    x = np.asarray(x, dtype=np.float64)
+    baseline = float(np.percentile(x, baseline_percentile))
+    centered = x - baseline
     peak = float(np.max(centered))
     if peak < 1e-30:
         return np.zeros_like(centered)
-    scaled = centered / peak
-
-    logger.debug(
-        "HRF centering: baseline=%.4f (from %d quiet samples), "
-        "range after=[%.3f, %.3f]",
-        baseline, n_quiet, scaled.min(), scaled.max(),
-    )
-    return scaled
+    return centered / peak
 
 
 def _scale_by_absmax(x: np.ndarray) -> np.ndarray:
     """Scale by max absolute value, preserving sign and zero baseline.
 
-    Used for derivatives of centered signals.
+    Used for derivatives of centered signals: the derivative of a
+    signal that is 0 at baseline is naturally 0 at baseline, so we
+    only need to scale the amplitude.
 
     Returns
     -------
@@ -124,6 +88,12 @@ def _scale_by_absmax(x: np.ndarray) -> np.ndarray:
     if peak < 1e-30:
         return np.zeros_like(x)
     return x / peak
+
+
+def _log_transform(x: np.ndarray) -> np.ndarray:
+    """``log(x - min(x) + 1)``."""
+    x = np.asarray(x, dtype=np.float64)
+    return np.log(x - x.min() + 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -268,21 +238,22 @@ def make_regressor(
     n_volumes: int,
     tr: float,
     center_hrf: bool = True,
+    center_hrf_percentile: float = 10.0,
 ) -> dict:
     """Build a full set of regressors from a normalised envelope.
 
     Parameters
     ----------
     envelope : 1-D array — normalised [0, 1] EMG envelope.
-        Quiet periods should be at (or very near) zero after
-        baseline correction.
     fsample : float — sampling rate of *envelope*.
     n_volumes : int — number of fMRI volumes.
     tr : float — repetition time (s).
-    center_hrf : bool — if *True*, the convolved signals are centered
-        so that their value during quiet envelope periods is zero.
-        The HRF undershoot is preserved as negative values.
-        Derivatives are computed on this centered signal.
+    center_hrf : bool — if *True*, HRF-convolved signals are centered
+        so baseline = 0 and the HRF undershoot is preserved as
+        negative values.  Derivatives are computed on this centered
+        signal.  If *False*, legacy [0, 1] normalisation is used.
+    center_hrf_percentile : float — percentile used to estimate the
+        convolution baseline (default 10).
 
     Returns
     -------
@@ -291,58 +262,40 @@ def make_regressor(
     ``time_reg``, ``mod``, ``log_mod``, ``dmod``, ``dlog_mod``.
 
     When ``center_hrf=True``:
-
-    - ``conv``, ``log_conv`` have baseline ≈ 0, peak = 1,
-      undershoot < 0.
+    - ``conv``, ``log_conv`` have baseline ≈ 0, peak ≈ 1, undershoot < 0.
     - ``dconv``, ``dlog_conv`` are in [-1, +1], baseline ≈ 0.
     - ``mod``, ``log_mod``, ``dmod``, ``dlog_mod`` remain in [0, 1].
     """
     ts = np.asarray(envelope, dtype=np.float64).ravel()
     hrf = spm_hrf(1.0 / fsample)
 
-    # ── Raw convolutions (unscaled) ──────────────────────────
+    # ── Raw convolutions ─────────────────────────────────────
     raw_conv = fftconvolve(ts, hrf, mode="full")[: len(ts)]
-
     log_ts = _log_transform(ts)
     raw_log_conv = fftconvolve(log_ts, hrf, mode="full")[: len(ts)]
 
     if center_hrf:
-        # ── Center using quiet periods from the envelope ─────
-        #
-        # The envelope has quiet periods at exactly 0 (after robust
-        # baseline correction).  We measure the median convolution
-        # value during those periods — that IS the true baseline.
-        #
-        # This correctly identifies the resting level, unlike a
-        # global percentile which could catch the HRF undershoot
-        # (which sits BELOW baseline).
+        # ── Centered mode: baseline = 0, undershoot preserved ──
+        pct = center_hrf_percentile
 
-        conv = _center_at_quiet(raw_conv, ts)
-        log_conv = _center_at_quiet(raw_log_conv, ts)
+        conv = _center_and_scale(raw_conv, pct)
+        log_conv = _center_and_scale(raw_log_conv, pct)
 
-        # Derivatives on the centered signal, then scale
+        # Derivatives on centered signals, then scale
         dconv = _scale_by_absmax(np.concatenate([[0], np.diff(conv)]))
-        dlog_conv = _scale_by_absmax(
-            np.concatenate([[0], np.diff(log_conv)]))
+        dlog_conv = _scale_by_absmax(np.concatenate([[0], np.diff(log_conv)]))
 
-        # Log sanity check
-        n_quiet = int(np.sum(ts < 0.01))
-        pct_quiet = 100.0 * n_quiet / len(ts)
-        logger.info(
-            "HRF centering: %.1f%% quiet samples, "
-            "conv range [%.3f, %.3f], "
+        logger.debug(
+            "HRF centering: conv range [%.3f, %.3f], "
             "log_conv range [%.3f, %.3f]",
-            pct_quiet,
-            conv.min(), conv.max(),
-            log_conv.min(), log_conv.max(),
+            conv.min(), conv.max(), log_conv.min(), log_conv.max(),
         )
     else:
-        # ── Legacy mode: everything in [0, 1] ────────────────
+        # ── Legacy mode: everything in [0, 1] ───────────────
         conv = _normalize_range(raw_conv)
         log_conv = _normalize_range(raw_log_conv)
         dconv = _normalize_range(np.concatenate([[0], np.diff(conv)]))
-        dlog_conv = _normalize_range(
-            np.concatenate([[0], np.diff(log_conv)]))
+        dlog_conv = _normalize_range(np.concatenate([[0], np.diff(log_conv)]))
 
     # ── Non-convolved modulations (always [0, 1]) ────────────
     mod_s = _normalize_range(ts)
@@ -352,8 +305,7 @@ def make_regressor(
 
     # ── Downsample to TR ─────────────────────────────────────
     time_conv = np.arange(len(conv)) / fsample
-    idx = np.round(
-        np.linspace(0, len(time_conv) - 1, n_volumes)).astype(int)
+    idx = np.round(np.linspace(0, len(time_conv) - 1, n_volumes)).astype(int)
     time_reg = time_conv[idx]
 
     return dict(
@@ -378,7 +330,7 @@ def _save_channel_mat(
     envelope_raw: np.ndarray,
     envelope_corrected: np.ndarray,
 ) -> str:
-    """Save all regressors and envelopes for one channel as .mat."""
+    """Save all regressors and envelopes for one channel as a single .mat."""
     mat_dict = {}
     for key, val in reginfo.items():
         mat_dict[key] = np.atleast_1d(val)
@@ -412,6 +364,7 @@ def build_and_export_regressors(
     envelope_window_sec: float = 30.0,
     envelope_threshold_factor: float = 2.5,
     center_hrf: bool = True,
+    center_hrf_percentile: float = 10.0,
 ) -> dict:
     """Build EMG regressors for all channels and write to disk.
 
@@ -431,7 +384,8 @@ def build_and_export_regressors(
     envelope_percentile : float — percentile for rolling baseline.
     envelope_window_sec : float — window length (s) for rolling baseline.
     envelope_threshold_factor : float — noise threshold multiplier.
-    center_hrf : bool — center convolutions at quiet-period baseline = 0.
+    center_hrf : bool — center HRF convolutions at baseline = 0.
+    center_hrf_percentile : float — percentile for baseline estimation.
 
     Returns
     -------
@@ -491,8 +445,16 @@ def build_and_export_regressors(
         reginfo = make_regressor(
             envelope_ds, fs_reg, n_vol, tr,
             center_hrf=center_hrf,
+            center_hrf_percentile=center_hrf_percentile,
         )
         all_regressors[ch_name] = reginfo
+
+        if center_hrf:
+            logger.info(
+                "%s regressors: conv range [%.3f, %.3f], "
+                "baseline ≈ 0, undershoot preserved",
+                ch_name, reginfo["conv"].min(), reginfo["conv"].max(),
+            )
 
         # ── 7. Save per-channel .mat ─────────────────────────
         mat_path = _save_channel_mat(

@@ -1,9 +1,17 @@
-"""EMG envelope, HRF convolution, and regressor construction.
+"""EMG envelope, HRF convolution, regressor construction,
+and envelope baseline correction.
 
 Reproduces the logic of ``farm_emg_regressor`` / ``farm_make_regressor``:
 
     Bandpass → Hilbert envelope → Normalize [0,1]
-    → ↓ 1000 Hz → HRF convolution → derivatives + log → ↓ TR
+    → Baseline correction → ↓ 1000 Hz
+    → HRF convolution → **center using quiet periods** → derivatives → ↓ TR
+
+When ``center_hrf=True``, quiet periods are identified from the
+envelope (where it is zero after baseline correction).  The median
+convolution value during those quiet periods defines the true
+baseline and is subtracted.  The HRF undershoot is preserved as
+negative values.  Derivatives are computed on this centered signal.
 """
 
 import logging
@@ -12,7 +20,11 @@ from math import gcd
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import fftconvolve, hilbert as _hilbert, butter, sosfiltfilt, resample_poly
+from scipy.ndimage import percentile_filter as _percentile_filter
+from scipy.signal import (
+    fftconvolve, hilbert as _hilbert,
+    butter, sosfiltfilt, resample_poly,
+)
 from scipy.stats import gamma as _gamma_dist
 from scipy.io import savemat
 
@@ -21,10 +33,12 @@ from farm.preprocessing.filters import apply_bandpass
 logger = logging.getLogger("farm.export.regressors")
 
 
-# ── Primitives ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Normalisation primitives
+# ═══════════════════════════════════════════════════════════════
 
 def _normalize_range(x: np.ndarray) -> np.ndarray:
-    """Scale to [0, 1]."""
+    """Scale to [0, 1]  (legacy behaviour)."""
     x = np.asarray(x, dtype=np.float64)
     mn, mx = float(x.min()), float(x.max())
     return np.zeros_like(x) if mx - mn < 1e-30 else (x - mn) / (mx - mn)
@@ -35,6 +49,86 @@ def _log_transform(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     return np.log(x - x.min() + 1.0)
 
+
+def _center_at_quiet(
+    convolved: np.ndarray,
+    envelope: np.ndarray,
+    quiet_threshold: float = 0.01,
+) -> np.ndarray:
+    """Center a convolved signal so that baseline = 0, peak = 1.
+
+    The baseline is measured as the **median convolution value during
+    quiet periods** (where the source envelope is near zero).
+
+    This is far more robust than a global percentile on the convolved
+    signal, which can accidentally pick up the HRF undershoot
+    (which is *below* the true baseline).
+
+    Parameters
+    ----------
+    convolved : 1-D array — raw HRF-convolved signal.
+    envelope : 1-D array — the input envelope (same length).
+        Quiet periods are identified as ``envelope < quiet_threshold``.
+    quiet_threshold : float — values of *envelope* below this are
+        considered quiet (default 0.01).  With the ``"robust"``
+        baseline correction, quiet samples are exactly 0.
+
+    Returns
+    -------
+    1-D float64 array.  Baseline ≈ 0, peak = 1, undershoot < 0.
+    """
+    convolved = np.asarray(convolved, dtype=np.float64)
+    envelope = np.asarray(envelope, dtype=np.float64)
+
+    quiet_mask = envelope < quiet_threshold
+    n_quiet = int(np.sum(quiet_mask))
+
+    if n_quiet >= 10:
+        # Enough quiet samples — use their median as baseline
+        baseline = float(np.median(convolved[quiet_mask]))
+    else:
+        # Fallback: very few quiet samples (unlikely with robust correction)
+        # Use the 5th percentile as a conservative estimate
+        baseline = float(np.percentile(convolved, 5))
+        logger.warning(
+            "Only %d quiet samples found (threshold=%.3f) — "
+            "using 5th percentile fallback for HRF baseline.",
+            n_quiet, quiet_threshold,
+        )
+
+    centered = convolved - baseline
+    peak = float(np.max(centered))
+    if peak < 1e-30:
+        return np.zeros_like(centered)
+    scaled = centered / peak
+
+    logger.debug(
+        "HRF centering: baseline=%.4f (from %d quiet samples), "
+        "range after=[%.3f, %.3f]",
+        baseline, n_quiet, scaled.min(), scaled.max(),
+    )
+    return scaled
+
+
+def _scale_by_absmax(x: np.ndarray) -> np.ndarray:
+    """Scale by max absolute value, preserving sign and zero baseline.
+
+    Used for derivatives of centered signals.
+
+    Returns
+    -------
+    1-D float64 array with values in [-1, +1].
+    """
+    x = np.asarray(x, dtype=np.float64)
+    peak = float(np.max(np.abs(x)))
+    if peak < 1e-30:
+        return np.zeros_like(x)
+    return x / peak
+
+
+# ═══════════════════════════════════════════════════════════════
+#  HRF
+# ═══════════════════════════════════════════════════════════════
 
 def spm_hrf(dt: float) -> np.ndarray:
     """SPM canonical double-gamma HRF at resolution *dt* (s)."""
@@ -47,8 +141,12 @@ def spm_hrf(dt: float) -> np.ndarray:
     return hrf / np.max(np.abs(hrf))
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Envelope
+# ═══════════════════════════════════════════════════════════════
+
 def emg_envelope(
-    ts_1d: np.ndarray, fsample: float, filter_order: int = 8
+    ts_1d: np.ndarray, fsample: float, filter_order: int = 8,
 ) -> np.ndarray:
     """Hilbert envelope → normalise [0,1] → LP 10 Hz."""
     env = np.abs(_hilbert(ts_1d.astype(np.float64)))
@@ -59,33 +157,203 @@ def emg_envelope(
     return env
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Baseline correction
+# ═══════════════════════════════════════════════════════════════
+
+def _rolling_baseline(
+    envelope: np.ndarray,
+    srate: float,
+    window_sec: float,
+    percentile: float,
+) -> np.ndarray:
+    """Estimate a slowly-varying noise floor via rolling percentile."""
+    ds = max(1, int(round(srate / 50)))
+    env_ds = envelope[::ds].astype(np.float64)
+    srate_ds = srate / ds
+
+    win = int(round(window_sec * srate_ds))
+    win = max(3, win)
+    if win % 2 == 0:
+        win += 1
+
+    bl_ds = _percentile_filter(env_ds, percentile, size=win, mode="reflect")
+
+    x_ds = np.arange(len(bl_ds), dtype=np.float64) * ds
+    baseline = np.interp(
+        np.arange(len(envelope), dtype=np.float64), x_ds, bl_ds,
+    )
+    return baseline[: len(envelope)]
+
+
+def _estimate_noise_std(corrected: np.ndarray) -> float:
+    """Robustly estimate the standard deviation of the noise floor."""
+    q25 = float(np.percentile(corrected, 25))
+    noise_samples = corrected[corrected <= q25]
+    if len(noise_samples) < 10:
+        return float(np.std(corrected)) * 0.1
+    med = float(np.median(noise_samples))
+    mad = float(np.median(np.abs(noise_samples - med)))
+    return mad / 0.6745 if mad > 0 else float(np.std(noise_samples))
+
+
+def correct_envelope_baseline(
+    envelope: np.ndarray,
+    srate: float,
+    method: str = "robust",
+    percentile: float = 10.0,
+    window_sec: float = 30.0,
+    threshold_factor: float = 2.5,
+) -> tuple:
+    """Remove the residual noise floor from an EMG envelope.
+
+    Parameters
+    ----------
+    envelope : 1-D array — normalised [0, 1] EMG envelope.
+    srate : float — sampling rate of *envelope* (Hz).
+    method : ``"none"`` | ``"percentile"`` | ``"robust"``
+    percentile : float — percentile for baseline (default 10).
+    window_sec : float — rolling window in seconds (default 30).
+    threshold_factor : float — values below
+        ``factor × noise_std`` are zeroed (default 2.5).
+
+    Returns
+    -------
+    corrected : 1-D float64 array, normalised [0, 1].
+    info : dict — diagnostic data for plotting.
+    """
+    envelope = np.asarray(envelope, dtype=np.float64).ravel()
+    info = {"method": method}
+
+    if method == "none":
+        return envelope.copy(), info
+
+    baseline = _rolling_baseline(envelope, srate, window_sec, percentile)
+    subtracted = np.maximum(0.0, envelope - baseline)
+    info["baseline"] = baseline
+    info["before_threshold"] = subtracted.copy()
+
+    if method == "percentile":
+        info["threshold_value"] = 0.0
+        info["noise_std"] = 0.0
+        return _normalize_range(subtracted), info
+
+    noise_std = _estimate_noise_std(subtracted)
+    threshold_value = threshold_factor * noise_std
+
+    thresholded = subtracted.copy()
+    thresholded[thresholded < threshold_value] = 0.0
+
+    info["noise_std"] = noise_std
+    info["threshold_value"] = threshold_value
+
+    logger.info(
+        "Envelope baseline correction: noise_std=%.4e, "
+        "threshold=%.4e (%.1f × σ), "
+        "%.1f%% of samples zeroed",
+        noise_std, threshold_value, threshold_factor,
+        100.0 * np.mean(thresholded == 0),
+    )
+
+    return _normalize_range(thresholded), info
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Regressor construction
+# ═══════════════════════════════════════════════════════════════
+
 def make_regressor(
-    envelope: np.ndarray, fsample: float, n_volumes: int, tr: float
+    envelope: np.ndarray,
+    fsample: float,
+    n_volumes: int,
+    tr: float,
+    center_hrf: bool = True,
 ) -> dict:
     """Build a full set of regressors from a normalised envelope.
 
-    Returns a dict with keys: ``conv``, ``dconv``, ``log_conv``,
-    ``dlog_conv``, ``time_conv``, ``reg``, ``dreg``, ``log_reg``,
-    ``dlog_reg``, ``time_reg``, ``mod``, ``log_mod``, ``dmod``,
-    ``dlog_mod``.
+    Parameters
+    ----------
+    envelope : 1-D array — normalised [0, 1] EMG envelope.
+        Quiet periods should be at (or very near) zero after
+        baseline correction.
+    fsample : float — sampling rate of *envelope*.
+    n_volumes : int — number of fMRI volumes.
+    tr : float — repetition time (s).
+    center_hrf : bool — if *True*, the convolved signals are centered
+        so that their value during quiet envelope periods is zero.
+        The HRF undershoot is preserved as negative values.
+        Derivatives are computed on this centered signal.
+
+    Returns
+    -------
+    dict with keys: ``conv``, ``dconv``, ``log_conv``, ``dlog_conv``,
+    ``time_conv``, ``reg``, ``dreg``, ``log_reg``, ``dlog_reg``,
+    ``time_reg``, ``mod``, ``log_mod``, ``dmod``, ``dlog_mod``.
+
+    When ``center_hrf=True``:
+
+    - ``conv``, ``log_conv`` have baseline ≈ 0, peak = 1,
+      undershoot < 0.
+    - ``dconv``, ``dlog_conv`` are in [-1, +1], baseline ≈ 0.
+    - ``mod``, ``log_mod``, ``dmod``, ``dlog_mod`` remain in [0, 1].
     """
     ts = np.asarray(envelope, dtype=np.float64).ravel()
     hrf = spm_hrf(1.0 / fsample)
 
-    conv = _normalize_range(fftconvolve(ts, hrf, mode="full")[: len(ts)])
-    log_ts = _normalize_range(_log_transform(ts))
-    log_conv = _normalize_range(fftconvolve(log_ts, hrf, mode="full")[: len(ts)])
+    # ── Raw convolutions (unscaled) ──────────────────────────
+    raw_conv = fftconvolve(ts, hrf, mode="full")[: len(ts)]
 
-    dconv = _normalize_range(np.concatenate([[0], np.diff(conv)]))
-    dlog_conv = _normalize_range(np.concatenate([[0], np.diff(log_conv)]))
+    log_ts = _log_transform(ts)
+    raw_log_conv = fftconvolve(log_ts, hrf, mode="full")[: len(ts)]
 
+    if center_hrf:
+        # ── Center using quiet periods from the envelope ─────
+        #
+        # The envelope has quiet periods at exactly 0 (after robust
+        # baseline correction).  We measure the median convolution
+        # value during those periods — that IS the true baseline.
+        #
+        # This correctly identifies the resting level, unlike a
+        # global percentile which could catch the HRF undershoot
+        # (which sits BELOW baseline).
+
+        conv = _center_at_quiet(raw_conv, ts)
+        log_conv = _center_at_quiet(raw_log_conv, ts)
+
+        # Derivatives on the centered signal, then scale
+        dconv = _scale_by_absmax(np.concatenate([[0], np.diff(conv)]))
+        dlog_conv = _scale_by_absmax(
+            np.concatenate([[0], np.diff(log_conv)]))
+
+        # Log sanity check
+        n_quiet = int(np.sum(ts < 0.01))
+        pct_quiet = 100.0 * n_quiet / len(ts)
+        logger.info(
+            "HRF centering: %.1f%% quiet samples, "
+            "conv range [%.3f, %.3f], "
+            "log_conv range [%.3f, %.3f]",
+            pct_quiet,
+            conv.min(), conv.max(),
+            log_conv.min(), log_conv.max(),
+        )
+    else:
+        # ── Legacy mode: everything in [0, 1] ────────────────
+        conv = _normalize_range(raw_conv)
+        log_conv = _normalize_range(raw_log_conv)
+        dconv = _normalize_range(np.concatenate([[0], np.diff(conv)]))
+        dlog_conv = _normalize_range(
+            np.concatenate([[0], np.diff(log_conv)]))
+
+    # ── Non-convolved modulations (always [0, 1]) ────────────
     mod_s = _normalize_range(ts)
     log_mod = _normalize_range(log_ts)
     dmod = _normalize_range(np.concatenate([[0], np.diff(mod_s)]))
     dlog_mod = _normalize_range(np.concatenate([[0], np.diff(log_mod)]))
 
+    # ── Downsample to TR ─────────────────────────────────────
     time_conv = np.arange(len(conv)) / fsample
-    idx = np.round(np.linspace(0, len(time_conv) - 1, n_volumes)).astype(int)
+    idx = np.round(
+        np.linspace(0, len(time_conv) - 1, n_volumes)).astype(int)
     time_reg = time_conv[idx]
 
     return dict(
@@ -99,7 +367,34 @@ def make_regressor(
     )
 
 
-# ── High-level export ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  Per-channel .mat export
+# ═══════════════════════════════════════════════════════════════
+
+def _save_channel_mat(
+    reg_dir: Path,
+    ch_name: str,
+    reginfo: dict,
+    envelope_raw: np.ndarray,
+    envelope_corrected: np.ndarray,
+) -> str:
+    """Save all regressors and envelopes for one channel as .mat."""
+    mat_dict = {}
+    for key, val in reginfo.items():
+        mat_dict[key] = np.atleast_1d(val)
+    mat_dict["envelope_raw"] = np.atleast_1d(envelope_raw)
+    mat_dict["envelope_corrected"] = np.atleast_1d(envelope_corrected)
+
+    path = str(reg_dir / f"{ch_name}_regressors.mat")
+    savemat(path, mat_dict, do_compression=True)
+    logger.debug("Per-channel MAT: %s (%.1f kB)", path,
+                 os.path.getsize(path) / 1e3)
+    return path
+
+
+# ═══════════════════════════════════════════════════════════════
+#  High-level export
+# ═══════════════════════════════════════════════════════════════
 
 def build_and_export_regressors(
     data_clean_crop: np.ndarray,
@@ -110,9 +405,33 @@ def build_and_export_regressors(
     bandpass: tuple,
     output_dir: str,
     basename: str,
+    fig_dir: Path | None = None,
     new_fsample: int = 1000,
+    envelope_baseline: str = "robust",
+    envelope_percentile: float = 10.0,
+    envelope_window_sec: float = 30.0,
+    envelope_threshold_factor: float = 2.5,
+    center_hrf: bool = True,
 ) -> dict:
     """Build EMG regressors for all channels and write to disk.
+
+    Parameters
+    ----------
+    data_clean_crop : ndarray, shape ``(n_ch, n_samples)``.
+    srate : float — original sampling rate.
+    ch_names : list of str.
+    n_vol : int — number of volumes.
+    tr : float — repetition time (s).
+    bandpass : tuple — ``(low_hz, high_hz)``.
+    output_dir : str — base output directory.
+    basename : str — file prefix.
+    fig_dir : Path or None — if set, diagnostic plots are saved here.
+    new_fsample : int — target sampling rate for regressors (default 1000).
+    envelope_baseline : str — correction method.
+    envelope_percentile : float — percentile for rolling baseline.
+    envelope_window_sec : float — window length (s) for rolling baseline.
+    envelope_threshold_factor : float — noise threshold multiplier.
+    center_hrf : bool — center convolutions at quiet-period baseline = 0.
 
     Returns
     -------
@@ -126,42 +445,89 @@ def build_and_export_regressors(
     srate_int = int(round(srate))
 
     for ch_i, ch_name in enumerate(ch_names):
-        ts_bp = apply_bandpass(data_clean_crop[ch_i], srate, bandpass).astype(np.float64)
-        envelope = emg_envelope(ts_bp, srate)
-        envelope_norm = _normalize_range(envelope)
+        logger.info("Building regressors for %s …", ch_name)
 
-        # Downsample to new_fsample
+        # ── 1. Bandpass ──────────────────────────────────────
+        ts_bp = apply_bandpass(
+            data_clean_crop[ch_i], srate, bandpass,
+        ).astype(np.float64)
+
+        # ── 2. Hilbert envelope ──────────────────────────────
+        envelope_raw = emg_envelope(ts_bp, srate)
+        envelope_norm = _normalize_range(envelope_raw)
+
+        # ── 3. Baseline correction ───────────────────────────
+        envelope_corrected, correction_info = correct_envelope_baseline(
+            envelope_norm, srate,
+            method=envelope_baseline,
+            percentile=envelope_percentile,
+            window_sec=envelope_window_sec,
+            threshold_factor=envelope_threshold_factor,
+        )
+
+        # ── 4. Diagnostic plot: baseline correction ──────────
+        if fig_dir is not None:
+            from farm.visualization.regressors import (
+                plot_envelope_correction,
+            )
+            plot_envelope_correction(
+                envelope_norm, envelope_corrected, correction_info,
+                srate, ch_name, fig_dir,
+            )
+
+        # ── 5. Downsample to new_fsample ─────────────────────
         if srate_int > new_fsample:
             g = gcd(new_fsample, srate_int)
             up_f, down_f = new_fsample // g, srate_int // g
-            envelope_ds = resample_poly(envelope_norm, up_f, down_f).astype(np.float64)
+            envelope_ds = resample_poly(
+                envelope_corrected, up_f, down_f,
+            ).astype(np.float64)
             fs_reg = float(new_fsample)
         else:
-            envelope_ds = envelope_norm.copy()
+            envelope_ds = envelope_corrected.copy()
             fs_reg = float(srate)
 
-        reginfo = make_regressor(envelope_ds, fs_reg, n_vol, tr)
+        # ── 6. Build regressors ──────────────────────────────
+        reginfo = make_regressor(
+            envelope_ds, fs_reg, n_vol, tr,
+            center_hrf=center_hrf,
+        )
         all_regressors[ch_name] = reginfo
 
-        # Save per-channel files
-        for rk in ["reg", "dreg", "log_reg", "dlog_reg",
-                    "mod", "log_mod", "dmod", "dlog_mod"]:
-            np.save(str(reg_dir / f"{ch_name}_{rk}.npy"), reginfo[rk])
-        np.save(str(reg_dir / f"{ch_name}_time_reg.npy"), reginfo["time_reg"])
-        np.save(str(reg_dir / f"{ch_name}_conv_hires.npy"), reginfo["conv"])
-        np.save(str(reg_dir / f"{ch_name}_time_conv.npy"), reginfo["time_conv"])
-        np.save(str(reg_dir / f"{ch_name}_envelope.npy"), envelope_norm)
+        # ── 7. Save per-channel .mat ─────────────────────────
+        mat_path = _save_channel_mat(
+            reg_dir, ch_name, reginfo,
+            envelope_norm, envelope_corrected,
+        )
+        logger.info("Regressors for %s → %s", ch_name, mat_path)
 
-        logger.info("Regressors for %s saved.", ch_name)
+        # ── 8. Regressor overview plots ──────────────────────
+        if fig_dir is not None:
+            from farm.visualization.regressors import (
+                plot_regressor, plot_regressor_panels,
+            )
+            plot_regressor(
+                reginfo, ch_name, fig_dir,
+                envelope=envelope_corrected, srate_envelope=srate,
+                centered=center_hrf,
+            )
+            plot_regressor_panels(
+                reginfo, ch_name, fig_dir,
+                envelope=envelope_corrected, srate_envelope=srate,
+                centered=center_hrf,
+            )
 
-    # Consolidated MAT
-    mat_reg = {}
-    for ch_name, reginfo in all_regressors.items():
-        pfx = ch_name.replace(" ", "_").replace("-", "_")
+    # ── Consolidated .mat (all channels) ─────────────────────
+    mat_all = {}
+    for ch_name_r, reginfo in all_regressors.items():
+        pfx = ch_name_r.replace(" ", "_").replace("-", "_")
         for key, val in reginfo.items():
-            mat_reg[f"{pfx}_{key}"] = val
-    mat_path = str(out / f"{basename}_regressors.mat")
-    savemat(mat_path, mat_reg, do_compression=True)
-    logger.info("Consolidated MAT: %s (%.1f MB)", mat_path, os.path.getsize(mat_path) / 1e6)
+            mat_all[f"{pfx}_{key}"] = np.atleast_1d(val)
+    mat_all_path = str(out / f"{basename}_regressors.mat")
+    savemat(mat_all_path, mat_all, do_compression=True)
+    logger.info(
+        "Consolidated MAT: %s (%.1f MB)",
+        mat_all_path, os.path.getsize(mat_all_path) / 1e6,
+    )
 
     return all_regressors

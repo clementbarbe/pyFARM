@@ -13,6 +13,7 @@ def detect_volume_onsets(
     trigger: str,
     tr: float,
     n_volumes: int | None = None,
+    drop_last: bool = False,
 ) -> tuple:
     """Extract volume-onset sample indices from annotations.
 
@@ -22,6 +23,9 @@ def detect_volume_onsets(
     trigger : str — marker label to search for.
     tr : float — expected TR (s), used for validation.
     n_volumes : int or None — keep only the first *n* volumes.
+    drop_last : bool — if *True*, unconditionally remove the last
+        detected volume.  Use when the acquisition was stopped
+        manually and the final volume may be incomplete.
 
     Returns
     -------
@@ -45,17 +49,27 @@ def detect_volume_onsets(
     srate = float(raw.info["sfreq"])
     vol_onsets = events[events[:, 2] == target_id, 0].astype(np.int64)
 
-    # Drop last volume if incomplete
-    if len(vol_onsets) >= 2:
-        needed = int(tr * srate * 0.90)
-        if (raw.n_times - vol_onsets[-1]) < needed:
-            logger.warning("Last volume incomplete — removed.")
-            vol_onsets = vol_onsets[:-1]
-
     if n_volumes is not None:
         vol_onsets = vol_onsets[:n_volumes]
 
+    # ── Drop last volume if requested (manual stop) ──────────
+    if drop_last and len(vol_onsets) > 1:
+        logger.info(
+            "Dropping last volume (onset sample %d, t=%.2f s) — "
+            "manual acquisition stop assumed.",
+            vol_onsets[-1], vol_onsets[-1] / srate,
+        )
+        vol_onsets = vol_onsets[:-1]
+
+    if len(vol_onsets) < 2:
+        raise ValueError(
+            f"Only {len(vol_onsets)} volume(s) found — "
+            f"need at least 2 to run the pipeline."
+        )
+
     n_vol = len(vol_onsets)
+
+    # ── IVI statistics ───────────────────────────────────────
     ivis = np.diff(vol_onsets) / srate
     ivi_stats = {
         "mean": float(np.mean(ivis)),

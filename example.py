@@ -25,9 +25,9 @@ cfg = FARMConfig(
     mb_factor=3,
     trigger="R128",
     ch_regex=r"EXT|FLE",
-    output_dir="output",
-    # figures_dir=None means figures go to output/figures/
-    # figures_dir="" disables figures entirely
+    output_dir="FARM_output",
+    # Set to True if the fMRI was stopped manually mid-volume
+    drop_last_volume=True,
 )
 
 results = run_pipeline(cfg)

@@ -31,6 +31,8 @@ class FARMConfig:
         Number of best-correlated candidates kept per template.
     n_volumes : int or None
         If set, only process the first *n_volumes* volumes.
+    drop_last_volume : bool
+        If *True*, unconditionally remove the last detected volume.
     time_section : float
         Duration (s) of each PCA section.
     var_threshold : float
@@ -43,12 +45,28 @@ class FARMConfig:
         Low-pass filter cutoff (Hz) applied in post-processing.
     padding : int
         Extra samples on each side for FFT phase-shift extraction.
+    envelope_baseline : str
+        Baseline correction method for the EMG envelope.
+    envelope_percentile : float
+        Percentile used for the rolling baseline estimate.
+    envelope_window_sec : float
+        Window length (seconds) for the rolling percentile.
+    envelope_threshold_factor : float
+        Noise threshold multiplier.
+    center_hrf : bool
+        If *True* (default), the HRF-convolved regressors are centered
+        so that baseline periods sit at zero and the HRF undershoot
+        is preserved as negative values.  Derivatives are computed on
+        this centered signal.
+        If *False*, legacy [0, 1] normalisation is used.
+    center_hrf_percentile : float
+        Percentile used to estimate the baseline level of the convolved
+        signal (default 10).  Lower values track the floor more tightly.
+        Only used when ``center_hrf=True``.
     output_dir : str
         Directory where all outputs are written.
     figures_dir : str or None
         Directory for diagnostic ``.png`` figures.
-        If *None*, defaults to ``<output_dir>/figures``.
-        Set to empty string ``""`` to disable figure generation entirely.
     """
 
     # ── Input ────────────────────────────────────────────────
@@ -66,6 +84,7 @@ class FARMConfig:
     window_size: int = 50
     n_candidates: int = 12
     n_volumes: Optional[int] = None
+    drop_last_volume: bool = False
     time_section: float = 60.0
     var_threshold: float = 5.0
     bandpass: Tuple[float, float] = (30, 250)
@@ -73,8 +92,17 @@ class FARMConfig:
     lpf_cutoff: float = 250.0
     padding: int = 10
 
+    # ── Envelope baseline correction ─────────────────────────
+    envelope_baseline: str = "robust"
+    envelope_percentile: float = 10.0
+    envelope_window_sec: float = 30.0
+    envelope_threshold_factor: float = 2.5
+
+    # ── HRF centering ────────────────────────────────────────
+    center_hrf: bool = True
+
     # ── Output ───────────────────────────────────────────────
-    output_dir: str = "output"
+    output_dir: str = "FARM_output"
     figures_dir: Optional[str] = None
 
     # ── Derived ──────────────────────────────────────────────
@@ -107,3 +135,7 @@ class FARMConfig:
             f"{self.n_slices} slices not divisible by MB={self.mb_factor}"
         )
         assert self.interp_factor >= 1, "interp_factor must be >= 1"
+        assert self.envelope_baseline in ("none", "percentile", "robust"), (
+            f"envelope_baseline must be 'none', 'percentile' or 'robust', "
+            f"got '{self.envelope_baseline}'"
+        )

@@ -177,7 +177,19 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("TRIGGER DETECTION", "🎯")
     vol_onsets, n_vol, ivi_stats = detect_volume_onsets(
         raw, cfg.trigger, cfg.tr, cfg.n_volumes,
+        drop_last=cfg.drop_last_volume,
     )
+    if cfg.drop_last_volume:
+        info_table([
+            ("⚠️ drop_last_volume", "ON — last trigger removed (manual stop assumed)"),
+            ("Volumes retained", f"{n_vol}"),
+        ])
+    info_table([
+        ("Volumes", f"{n_vol}"),
+        ("IVI mean", f"{ivi_stats['mean'] * 1e3:.2f} ms"),
+        ("IVI jitter max", f"{ivi_stats['jitter_max'] * 1e6:.1f} µs"),
+    ])
+
     if fig_dir is not None:
         from farm.visualization.timeseries import plot_ivi
         plot_ivi(ivi_stats, cfg.tr, fig_dir)
@@ -196,14 +208,22 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         plot_raw_channels(data, ch_names, srate, vol_onsets, fig_dir)
 
     # ────────────────────────────────────────────────────────
-    # 4. Trim to scan boundaries
+    # 4. Trim to scan boundaries (incomplete volumes removed)
     # ────────────────────────────────────────────────────────
     banner("TRIM TO SCAN", "✂️")
-    data, vol_onsets, vol_onsets_abs, s_trim, e_trim = trim_to_scan(
+    (data, vol_onsets, vol_onsets_abs,
+     s_trim, e_trim, n_vol) = trim_to_scan(
         data, vol_onsets, srate, cfg.tr,
     )
     data_raw_trim = data.copy()
     n_samples_orig = data.shape[1]
+
+    info_table([
+        ("Complete volumes", f"{n_vol}"),
+        ("Working region", f"samples {s_trim}–{e_trim} ({n_samples_orig / srate:.1f} s)"),
+        ("Full signal", f"{n_samples_full:,} samples ({n_samples_full / srate:.1f} s)"),
+        ("Guarantee", "Every volume has a full TR of data"),
+    ])
 
     # ────────────────────────────────────────────────────────
     # 5. High-pass filter 30 Hz
@@ -386,6 +406,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         vol_onsets_abs=vol_onsets_abs,
         s_trim=s_trim, e_trim=e_trim,
         sdur=sdur, dtime=dtime, tr=cfg.tr, n_sg=cfg.n_sg,
+        n_vol=n_vol,
     )
     export_mat(
         cfg.output_dir, basename,
@@ -399,6 +420,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         vol_onsets_abs=vol_onsets_abs,
         s_trim=s_trim, e_trim=e_trim,
         sdur=sdur, dtime=dtime, tr=cfg.tr, n_sg=cfg.n_sg,
+        n_vol=n_vol,
         time_full=np.arange(n_samples_full) / srate,
         time_crop=np.arange(n_samples_orig) / srate,
     )
@@ -410,6 +432,12 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     all_regressors = build_and_export_regressors(
         data_clean_crop, srate, ch_names, n_vol, cfg.tr,
         cfg.bandpass, cfg.output_dir, basename,
+        fig_dir=fig_dir,
+        envelope_baseline=cfg.envelope_baseline,
+        envelope_percentile=cfg.envelope_percentile,
+        envelope_window_sec=cfg.envelope_window_sec,
+        envelope_threshold_factor=cfg.envelope_threshold_factor,
+        center_hrf=cfg.center_hrf,
     )
 
     # ────────────────────────────────────────────────────────
@@ -417,6 +445,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     # ────────────────────────────────────────────────────────
     banner("PIPELINE COMPLETE", "🏁")
     info_table([
+        ("Complete volumes", f"{n_vol}"),
         ("sdur", f"{sdur * 1e3:.4f} ms"),
         ("dtime", f"{dtime * 1e3:.4f} ms"),
         ("TR", f"{(cfg.n_sg * sdur + dtime) * 1e3:.4f} ms"),

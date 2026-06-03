@@ -2,7 +2,7 @@
 
 - ``plot_envelope_correction`` — baseline correction diagnostic.
 - ``plot_regressor`` — single-axis overview (MATLAB farm_plot_regressor style).
-- ``plot_regressor_panels`` — multi-panel detailed view.
+- ``plot_regressor_panels`` — multi-panel showing ALL 8 regressors + derivatives.
 """
 
 from pathlib import Path
@@ -13,13 +13,16 @@ import matplotlib.pyplot as plt
 from .plotting import savefig
 
 
-_COLORS = [
-    "#0072BD",  # blue
-    "#D95319",  # orange
-    "#EDB120",  # yellow
-    "#7E2F8E",  # purple
-    "#77AC30",  # green
-]
+_COLORS = {
+    "conv":      "#D95319",  # orange
+    "dconv":     "#EDB120",  # yellow
+    "log_conv":  "#7E2F8E",  # purple
+    "dlog_conv": "#77AC30",  # green
+    "mod":       "#0072BD",  # blue
+    "log_mod":   "#A2142F",  # dark red
+    "dmod":      "#4DBEEE",  # cyan
+    "dlog_mod":  "#D95319",  # orange (reused, different panel)
+}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -50,75 +53,63 @@ def plot_envelope_correction(
 
     fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=False)
 
-    # Panel 1: original + baseline + threshold
     ax = axes[0]
-    ax.plot(t[sl], envelope_raw[sl],
-            color="black", lw=0.4, alpha=0.7, label="Original envelope")
+    ax.plot(t[sl], envelope_raw[sl], color="black", lw=0.4, alpha=0.7,
+            label="Original envelope")
     if baseline is not None:
-        ax.plot(t[sl], baseline[sl],
-                color="#d62728", lw=1.5, alpha=0.9, label="Estimated baseline")
+        ax.plot(t[sl], baseline[sl], color="#d62728", lw=1.5, alpha=0.9,
+                label="Estimated baseline")
         ax.fill_between(t[sl], 0, baseline[sl], color="#d62728", alpha=0.08)
     if threshold_value > 0 and baseline is not None:
         thresh_line = np.clip(baseline + threshold_value, 0, 1)
-        ax.plot(t[sl], thresh_line[sl],
-                color="#FF9800", lw=1.0, ls="--", alpha=0.8,
-                label=f"Threshold (baseline + {threshold_value:.4f})")
+        ax.plot(t[sl], thresh_line[sl], color="#FF9800", lw=1.0, ls="--",
+                alpha=0.8, label=f"Threshold (+{threshold_value:.4f})")
     ax.set_ylabel("Amplitude [0, 1]")
-    ax.set_title(f"Envelope baseline correction — {ch_name} — method: {method}")
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.set_title(f"Envelope baseline correction — {ch_name} — {method}")
+    ax.legend(loc="upper right", fontsize=9)
     ax.set_ylim([-0.02, 1.05])
     ax.grid(True, alpha=0.2)
 
-    # Panel 2: corrected
     ax = axes[1]
-    ax.plot(t[sl], envelope_raw[sl],
-            color="#d62728", lw=0.3, alpha=0.3, label="Before correction")
-    ax.plot(t[sl], envelope_corrected[sl],
-            color="#2ca02c", lw=0.5, alpha=0.9, label="After correction")
+    ax.plot(t[sl], envelope_raw[sl], color="#d62728", lw=0.3, alpha=0.3,
+            label="Before")
+    ax.plot(t[sl], envelope_corrected[sl], color="#2ca02c", lw=0.5, alpha=0.9,
+            label="After")
     ax.set_ylabel("Amplitude [0, 1]")
     ax.set_title(f"Corrected envelope — {ch_name}")
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.legend(loc="upper right", fontsize=9)
     ax.set_ylim([-0.02, 1.05])
     ax.grid(True, alpha=0.2)
     pct_zero = 100.0 * np.mean(envelope_corrected == 0)
-    ax.text(
-        0.01, 0.95,
-        f"Samples at zero: {pct_zero:.1f}%  |  "
-        f"σ_noise: {noise_std:.4f}  |  threshold: {threshold_value:.4f}",
-        transform=ax.transAxes, fontsize=8, va="top",
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
-    )
+    ax.text(0.01, 0.95,
+            f"Zeroed: {pct_zero:.1f}%  |  σ_noise: {noise_std:.4f}",
+            transform=ax.transAxes, fontsize=8, va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
 
-    # Panel 3: zoom on transition
     ax = axes[2]
     zoom_half = int(min(10.0 * srate, N // 4))
     zoom_center = _find_transition(envelope_corrected, srate)
     z_start = max(0, zoom_center - zoom_half)
     z_stop = min(N, zoom_center + zoom_half)
-    z_sl = slice(z_start, z_stop)
-    t_z = t[z_sl]
-    ax.plot(t_z, envelope_raw[z_sl],
+    ax.plot(t[z_start:z_stop], envelope_raw[z_start:z_stop],
             color="#d62728", lw=0.6, alpha=0.5, label="Before")
-    ax.plot(t_z, envelope_corrected[z_sl],
+    ax.plot(t[z_start:z_stop], envelope_corrected[z_start:z_stop],
             color="#2ca02c", lw=1.0, alpha=0.9, label="After")
     if baseline is not None:
-        ax.plot(t_z, baseline[z_sl],
+        ax.plot(t[z_start:z_stop], baseline[z_start:z_stop],
                 color="#d62728", lw=1.2, ls="--", alpha=0.6, label="Baseline")
     ax.axhline(0, color="gray", lw=0.5, alpha=0.5)
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude [0, 1]")
-    ax.set_title(f"Zoom on quiet↔active transition — {ch_name}")
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.set_ylabel("Amplitude")
+    ax.set_title(f"Zoom quiet↔active — {ch_name}")
+    ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
     savefig(fig, fig_dir, f"{ch_name}_envelope_correction")
 
 
-def _find_transition(
-    envelope: np.ndarray, srate: float, min_jump: float = 0.2,
-) -> int:
-    """Find a sample index near a quiet→active transition."""
+def _find_transition(envelope, srate, min_jump=0.2):
     from scipy.ndimage import uniform_filter1d
     block_len = max(3, int(srate * 0.5))
     smoothed = uniform_filter1d(envelope.astype(np.float64), block_len)
@@ -136,7 +127,7 @@ def _find_transition(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Single-axis regressor overview
+#  Single-axis regressor overview (MATLAB style)
 # ═══════════════════════════════════════════════════════════════
 
 def plot_regressor(
@@ -147,15 +138,7 @@ def plot_regressor(
     srate_envelope: float | None = None,
     centered: bool = True,
 ) -> None:
-    """Single-axis overview of all regressor traces for one channel.
-
-    Reproduces the MATLAB ``farm_plot_regressor`` layout.
-
-    Parameters
-    ----------
-    centered : bool — if *True*, adds a zero line and adapts the
-        y-axis label to reflect that baseline = 0.
-    """
+    """Single-axis overview of all regressor traces."""
     t_conv = reginfo["time_conv"]
     t_reg = reginfo["time_reg"]
     stride = max(1, len(t_conv) // 30000)
@@ -163,38 +146,25 @@ def plot_regressor(
 
     fig, ax = plt.subplots(figsize=(18, 6))
 
-    # Envelope input
     if envelope is not None and srate_envelope is not None:
         t_env = np.arange(len(envelope)) / srate_envelope
         stride_e = max(1, len(t_env) // 30000)
         ax.plot(t_env[::stride_e], envelope[::stride_e],
-                ls="-", color="black", lw=0.6, alpha=0.5, label="envelope (in)")
+                ls="-", color="black", lw=0.6, alpha=0.4, label="envelope")
 
-    # conv / reg
-    ax.plot(t_conv[sc], reginfo["conv"][sc],
-            ls="-", color=_COLORS[1], lw=0.7, label="conv")
-    ax.plot(t_reg, reginfo["reg"],
-            ls="-.", color=_COLORS[1], lw=1.2, marker=".", ms=3, label="reg")
+    # Convolved (hires + TR)
+    for conv_k, reg_k, color, label in [
+        ("conv",      "reg",      _COLORS["conv"],      "conv"),
+        ("dconv",     "dreg",     _COLORS["dconv"],     "dconv"),
+        ("log_conv",  "log_reg",  _COLORS["log_conv"],  "log_conv"),
+        ("dlog_conv", "dlog_reg", _COLORS["dlog_conv"], "dlog_conv"),
+    ]:
+        ax.plot(t_conv[sc], reginfo[conv_k][sc],
+                ls="-", color=color, lw=0.6, alpha=0.7, label=label)
+        ax.plot(t_reg, reginfo[reg_k],
+                ls="-.", color=color, lw=1.0, marker=".", ms=2,
+                label=f"{reg_k} (TR)")
 
-    # dconv / dreg
-    ax.plot(t_conv[sc], reginfo["dconv"][sc],
-            ls="-", color=_COLORS[2], lw=0.7, label="dconv")
-    ax.plot(t_reg, reginfo["dreg"],
-            ls="-.", color=_COLORS[2], lw=1.2, marker=".", ms=3, label="dreg")
-
-    # log_conv / log_reg
-    ax.plot(t_conv[sc], reginfo["log_conv"][sc],
-            ls="-", color=_COLORS[3], lw=0.7, label="log_conv")
-    ax.plot(t_reg, reginfo["log_reg"],
-            ls="-.", color=_COLORS[3], lw=1.2, marker=".", ms=3, label="log_reg")
-
-    # dlog_conv / dlog_reg
-    ax.plot(t_conv[sc], reginfo["dlog_conv"][sc],
-            ls="-", color=_COLORS[4], lw=0.7, label="dlog_conv")
-    ax.plot(t_reg, reginfo["dlog_reg"],
-            ls="-.", color=_COLORS[4], lw=1.2, marker=".", ms=3, label="dlog_reg")
-
-    # Zero line for centered mode
     if centered:
         ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.6, zorder=0)
         ax.set_ylabel("Amplitude (baseline = 0)")
@@ -202,16 +172,15 @@ def plot_regressor(
         ax.set_ylabel("Amplitude [0, 1]")
 
     ax.set_xlabel("Time (s)")
-    title_suffix = " (HRF centered)" if centered else ""
-    ax.set_title(f"{ch_name}{title_suffix}")
-    ax.legend(loc="upper right", fontsize=8, ncol=2, framealpha=0.8)
+    ax.set_title(f"Regressor overview — {ch_name}")
+    ax.legend(loc="upper right", fontsize=7, ncol=3, framealpha=0.8)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     savefig(fig, fig_dir, f"{ch_name}_regressor_overview")
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Multi-panel regressor detail
+#  Multi-panel: ALL 8 regressors + derivatives
 # ═══════════════════════════════════════════════════════════════
 
 def plot_regressor_panels(
@@ -222,11 +191,19 @@ def plot_regressor_panels(
     srate_envelope: float | None = None,
     centered: bool = True,
 ) -> None:
-    """Multi-panel regressor plot (one row per family).
+    """Multi-panel plot showing ALL produced regressors.
 
-    Parameters
-    ----------
-    centered : bool — if *True*, adds zero lines and adapts labels.
+    8 panels (+ 1 for envelope if provided):
+
+    1. Envelope (input)
+    2. conv + reg — HRF convolution
+    3. dconv + dreg — Derivative of HRF convolution
+    4. log_conv + log_reg — Log-compressed HRF convolution
+    5. dlog_conv + dlog_reg — Derivative of log-compressed
+    6. mod — Direct modulation (TR only)
+    7. dmod — Derivative of direct modulation (TR only)
+    8. log_mod — Log-compressed modulation (TR only)
+    9. dlog_mod — Derivative of log-compressed modulation (TR only)
     """
     t_conv = reginfo["time_conv"]
     t_reg = reginfo["time_reg"]
@@ -234,55 +211,107 @@ def plot_regressor_panels(
     sc = slice(None, None, stride)
 
     has_env = envelope is not None and srate_envelope is not None
-    n_rows = 5 if has_env else 4
-    fig, axes = plt.subplots(n_rows, 1, figsize=(18, 3.2 * n_rows),
-                             sharex=True)
-    row = 0
+
+    # Build panel definitions
+    panels = []
 
     if has_env:
-        t_env = np.arange(len(envelope)) / srate_envelope
-        stride_e = max(1, len(t_env) // 30000)
-        axes[row].plot(t_env[::stride_e], envelope[::stride_e],
-                       ls="-", color="black", lw=0.6, alpha=0.7)
-        axes[row].set_ylabel("Amplitude [0, 1]")
-        axes[row].set_title(f"EMG envelope (corrected input) — {ch_name}")
-        axes[row].grid(True, alpha=0.25)
-        row += 1
+        panels.append({
+            "type": "envelope",
+            "title": f"EMG envelope (corrected input) — {ch_name}",
+        })
 
-    pairs = [
-        ("conv",      "reg",      _COLORS[1], "HRF convolution"),
-        ("dconv",     "dreg",     _COLORS[2], "Derivative of convolution"),
-        ("log_conv",  "log_reg",  _COLORS[3], "Log HRF convolution"),
-        ("dlog_conv", "dlog_reg", _COLORS[4], "Derivative of log convolution"),
+    # Convolution-based panels (hires + TR)
+    hrf_panels = [
+        ("conv",      "reg",      _COLORS["conv"],
+         "HRF Convolution", True),
+        ("dconv",     "dreg",     _COLORS["dconv"],
+         "Derivative of HRF Convolution", True),
+        ("log_conv",  "log_reg",  _COLORS["log_conv"],
+         "Log-compressed HRF Convolution", True),
+        ("dlog_conv", "dlog_reg", _COLORS["dlog_conv"],
+         "Derivative of Log-compressed HRF Convolution", True),
     ]
+    for conv_k, reg_k, color, title, use_centered in hrf_panels:
+        panels.append({
+            "type": "hires",
+            "conv_key": conv_k,
+            "reg_key": reg_k,
+            "color": color,
+            "title": f"{title} — {ch_name}",
+            "centered": use_centered,
+        })
 
-    for conv_key, reg_key, color, title in pairs:
+    # Modulation panels (TR only, always [0, 1])
+    mod_panels = [
+        ("mod",      _COLORS["mod"],      "Direct Modulation (non-convolved)"),
+        ("dmod",     _COLORS["dmod"],     "Derivative of Direct Modulation"),
+        ("log_mod",  _COLORS["log_mod"],  "Log-compressed Modulation (non-convolved)"),
+        ("dlog_mod", _COLORS["dlog_mod"], "Derivative of Log-compressed Modulation"),
+    ]
+    for key, color, title in mod_panels:
+        panels.append({
+            "type": "tr_only",
+            "key": key,
+            "color": color,
+            "title": f"{title} — {ch_name}",
+        })
+
+    n_rows = len(panels)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(18, 2.8 * n_rows),
+                             sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+
+    for row, panel in enumerate(panels):
         ax = axes[row]
-        ax.plot(t_conv[sc], reginfo[conv_key][sc],
-                ls="-", color=color, lw=0.7, alpha=0.8, label=conv_key)
-        ax.plot(t_reg, reginfo[reg_key],
-                ls="-.", color=color, lw=1.3, marker=".", ms=4, label=reg_key)
 
-        if centered:
-            ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.6, zorder=0)
-            ax.set_ylabel("Amplitude (baseline = 0)")
-        else:
-            ax.set_ylabel("Amplitude [0, 1]")
+        if panel["type"] == "envelope":
+            t_env = np.arange(len(envelope)) / srate_envelope
+            stride_e = max(1, len(t_env) // 30000)
+            ax.plot(t_env[::stride_e], envelope[::stride_e],
+                    ls="-", color="black", lw=0.6, alpha=0.7)
+            ax.set_ylabel("[0, 1]")
+            ax.set_ylim([-0.05, 1.1])
 
-        # Show min/max annotation for centered mode
-        if centered:
-            vals = reginfo[conv_key]
-            ax.text(
-                0.01, 0.05,
-                f"range: [{vals.min():.3f}, {vals.max():.3f}]",
-                transform=ax.transAxes, fontsize=8, va="bottom",
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
-            )
+        elif panel["type"] == "hires":
+            color = panel["color"]
+            conv_k = panel["conv_key"]
+            reg_k = panel["reg_key"]
 
-        ax.set_title(f"{title} — {ch_name}")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+            ax.plot(t_conv[sc], reginfo[conv_k][sc],
+                    ls="-", color=color, lw=0.7, alpha=0.8,
+                    label=f"{conv_k} (hires)")
+            ax.plot(t_reg, reginfo[reg_k],
+                    ls="none", color=color, marker="o", ms=3, alpha=0.9,
+                    label=f"{reg_k} (TR)")
+
+            if centered and panel["centered"]:
+                ax.axhline(0, color="gray", lw=0.8, ls="--", alpha=0.5,
+                           zorder=0)
+                ax.set_ylabel("baseline = 0")
+                vals = reginfo[conv_k]
+                ax.text(
+                    0.01, 0.05,
+                    f"range: [{vals.min():.3f}, {vals.max():.3f}]",
+                    transform=ax.transAxes, fontsize=8, va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+            else:
+                ax.set_ylabel("[0, 1]")
+
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+
+        elif panel["type"] == "tr_only":
+            color = panel["color"]
+            key = panel["key"]
+            ax.plot(t_reg, reginfo[key],
+                    ls="-", color=color, lw=1.2, marker="o", ms=3,
+                    alpha=0.9, label=f"{key} (TR)")
+            ax.set_ylabel("[0, 1]")
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+
+        ax.set_title(panel["title"], fontsize=10)
         ax.grid(True, alpha=0.25)
-        row += 1
 
     axes[-1].set_xlabel("Time (s)")
     fig.tight_layout()

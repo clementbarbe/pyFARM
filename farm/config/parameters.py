@@ -54,15 +54,13 @@ class FARMConfig:
     envelope_threshold_factor : float
         Noise threshold multiplier.
     center_hrf : bool
-        If *True* (default), the HRF-convolved regressors are centered
-        so that baseline periods sit at zero and the HRF undershoot
-        is preserved as negative values.  Derivatives are computed on
-        this centered signal.
-        If *False*, legacy [0, 1] normalisation is used.
-    center_hrf_percentile : float
-        Percentile used to estimate the baseline level of the convolved
-        signal (default 10).  Lower values track the floor more tightly.
-        Only used when ``center_hrf=True``.
+        If *True*, HRF-convolved regressors are centered at baseline = 0.
+    log_compress_gain : float
+        Gain for the compressive log transform applied before the
+        "log" HRF convolution path.  ``log(1 + gain·x) / log(1 + gain)``
+        maps [0, 1] → [0, 1] with low values boosted.
+        Default 50.  Higher = more compression.  Set to 0 to recover
+        the legacy ``log(x + 1)`` behaviour (nearly linear on [0, 1]).
     output_dir : str
         Directory where all outputs are written.
     figures_dir : str or None
@@ -98,27 +96,24 @@ class FARMConfig:
     envelope_window_sec: float = 30.0
     envelope_threshold_factor: float = 2.5
 
-    # ── HRF centering ────────────────────────────────────────
+    # ── HRF centering + log compression ──────────────────────
     center_hrf: bool = True
-    center_hrf_percentile: float = 10.0
+    log_compress_gain: float = 50.0
 
     # ── Output ───────────────────────────────────────────────
-    output_dir: str = "output"
+    output_dir: str = "FARM_output"
     figures_dir: Optional[str] = None
 
     # ── Derived ──────────────────────────────────────────────
     @property
     def n_sg(self) -> int:
-        """Number of slice-artifact groups per volume."""
         return self.n_slices // self.mb_factor
 
     @property
     def figures_enabled(self) -> bool:
-        """Whether diagnostic figures should be generated."""
         return self.figures_dir != ""
 
     def get_figures_dir(self) -> Path:
-        """Resolved figures directory, created on first call."""
         if self.figures_dir is None:
             p = Path(self.output_dir) / "figures"
         else:
@@ -127,7 +122,6 @@ class FARMConfig:
         return p
 
     def validate(self) -> None:
-        """Raise if the configuration is inconsistent."""
         assert self.vhdr_path, "vhdr_path must be set"
         assert self.tr > 0, f"TR must be positive, got {self.tr}"
         assert self.n_slices > 0, "n_slices must be positive"
@@ -140,3 +134,4 @@ class FARMConfig:
             f"envelope_baseline must be 'none', 'percentile' or 'robust', "
             f"got '{self.envelope_baseline}'"
         )
+        assert self.log_compress_gain >= 0, "log_compress_gain must be >= 0"

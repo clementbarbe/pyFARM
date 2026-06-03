@@ -25,7 +25,7 @@ cfg = FARMConfig(
     mb_factor=3,
     trigger="R128",
     ch_regex=r"EXT|FLE",
-    output_dir="FARM_output",
+    output_dir="output",
     # Set to True if the fMRI was stopped manually mid-volume
     drop_last_volume=True,
 )

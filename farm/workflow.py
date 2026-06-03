@@ -438,7 +438,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         envelope_window_sec=cfg.envelope_window_sec,
         envelope_threshold_factor=cfg.envelope_threshold_factor,
         center_hrf=cfg.center_hrf,
-        center_hrf_percentile=cfg.center_hrf_percentile,
+        log_compress_gain=cfg.log_compress_gain,
     )
 
     # ────────────────────────────────────────────────────────

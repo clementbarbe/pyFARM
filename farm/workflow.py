@@ -155,7 +155,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     """
     cfg.validate()
     t_total = time.time()
-    basename = Path(cfg.vhdr_path).stem + "_FARM"
+    run_name = Path(cfg.vhdr_path).stem + "_FARM"
+    cfg.output_dir = str(Path(cfg.output_dir) / run_name)
+    basename = run_name
 
     # Resolve figure output directory (None = disabled)
     fig_dir: Path | None = None

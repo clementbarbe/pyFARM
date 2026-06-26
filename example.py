@@ -21,10 +21,10 @@ from farm.workflow import run_pipeline
 cfg = FARMConfig(
     vhdr_path="data/me3mb3_tr1600_sl54.vhdr",
     tr=1.6,
-    n_slices=54,
+    n_slices=53,
     mb_factor=3,
     trigger="R128",
-    ch_regex=r"EXT|FLE",
+    ch_regex=r"ZYG|COR",
     output_dir="output",
     # Set to True if the fMRI was stopped manually mid-volume
     drop_last_volume=True,

@@ -101,7 +101,7 @@ class FARMConfig:
     log_compress_gain: float = 50.0
 
     # ── Output ───────────────────────────────────────────────
-    output_dir: str = "FARM_output"
+    output_dir: str = "output"
     figures_dir: Optional[str] = None
 
     # ── Derived ──────────────────────────────────────────────

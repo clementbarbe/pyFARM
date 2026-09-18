@@ -3,69 +3,12 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+import math
 
 
 @dataclass
 class FARMConfig:
-    """All user-facing parameters for a single FARM run.
-
-    Attributes
-    ----------
-    vhdr_path : str
-        Path to the BrainVision ``.vhdr`` header file.
-    tr : float
-        Repetition time in seconds.
-    n_slices : int
-        Total number of EPI slices per volume.
-    mb_factor : int
-        Multiband / simultaneous multi-slice factor (1 = no MB).
-    trigger : str
-        Volume-onset marker label (e.g. ``"R128"``).
-    ch_regex : str
-        Regex matched against channel names to select EMG channels.
-    interp_factor : int
-        Upsampling factor applied before FARM correction.
-    window_size : int
-        Half-width of the sliding window used to gather template candidates.
-    n_candidates : int
-        Number of best-correlated candidates kept per template.
-    n_volumes : int or None
-        If set, only process the first *n_volumes* volumes.
-    drop_last_volume : bool
-        If *True*, unconditionally remove the last detected volume.
-    time_section : float
-        Duration (s) of each PCA section.
-    var_threshold : float
-        Minimum explained-variance percentage to retain a PCA component.
-    bandpass : tuple of float
-        Band-pass limits (Hz) applied for diagnostic comparisons.
-    hpf_cutoff : float
-        High-pass filter cutoff (Hz) applied in preprocessing.
-    lpf_cutoff : float
-        Low-pass filter cutoff (Hz) applied in post-processing.
-    padding : int
-        Extra samples on each side for FFT phase-shift extraction.
-    envelope_baseline : str
-        Baseline correction method for the EMG envelope.
-    envelope_percentile : float
-        Percentile used for the rolling baseline estimate.
-    envelope_window_sec : float
-        Window length (seconds) for the rolling percentile.
-    envelope_threshold_factor : float
-        Noise threshold multiplier.
-    center_hrf : bool
-        If *True*, HRF-convolved regressors are centered at baseline = 0.
-    log_compress_gain : float
-        Gain for the compressive log transform applied before the
-        "log" HRF convolution path.  ``log(1 + gain·x) / log(1 + gain)``
-        maps [0, 1] → [0, 1] with low values boosted.
-        Default 50.  Higher = more compression.  Set to 0 to recover
-        the legacy ``log(x + 1)`` behaviour (nearly linear on [0, 1]).
-    output_dir : str
-        Directory where all outputs are written.
-    figures_dir : str or None
-        Directory for diagnostic ``.png`` figures.
-    """
+    """All user-facing parameters for a single FARM run."""
 
     # ── Input ────────────────────────────────────────────────
     vhdr_path: str = ""
@@ -79,16 +22,26 @@ class FARMConfig:
 
     # ── Processing ───────────────────────────────────────────
     interp_factor: int = 10
+
+    # window_size is now in VOLUMES, not in arbitrary global slices.
+    # For each slice-group, templates can use ±window_size nearby volumes.
     window_size: int = 50
+
     n_candidates: int = 12
     n_volumes: Optional[int] = None
     drop_last_volume: bool = False
+
     time_section: float = 60.0
     var_threshold: float = 5.0
-    bandpass: Tuple[float, float] = (30, 250)
+
+    bandpass: Tuple[float, float] = (30.0, 250.0)
     hpf_cutoff: float = 30.0
     lpf_cutoff: float = 250.0
     padding: int = 10
+
+    # Fraction of the actual inter-volume gap to suppress around
+    # the volume boundary. 0.0 means no masking; 1.0 masks all gap.
+    zero_fill_gap_fraction: float = 1.0
 
     # ── Envelope baseline correction ─────────────────────────
     envelope_baseline: str = "robust"
@@ -104,34 +57,115 @@ class FARMConfig:
     output_dir: str = "output"
     figures_dir: Optional[str] = None
 
-    # ── Derived ──────────────────────────────────────────────
     @property
     def n_sg(self) -> int:
-        return self.n_slices // self.mb_factor
+        """Number of acquisition slice-groups per volume.
+
+        ceil() deliberately supports protocols such as:
+        - 53 anatomical slices
+        - multiband factor 3
+        - 18 slice-group acquisition events
+
+        The final multiband group may contain fewer anatomical slices, but
+        it remains one acquisition event and therefore one gradient artifact.
+        """
+        return int(math.ceil(self.n_slices / self.mb_factor))
 
     @property
     def figures_enabled(self) -> bool:
         return self.figures_dir != ""
 
-    def get_figures_dir(self) -> Path:
+    def get_figures_dir(self) -> Path | None:
+        """Return/create figures directory, or None if figures are disabled."""
+        if self.figures_dir == "":
+            return None
+
         if self.figures_dir is None:
             p = Path(self.output_dir) / "figures"
         else:
             p = Path(self.figures_dir)
+
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def validate(self) -> None:
-        assert self.vhdr_path, "vhdr_path must be set"
-        assert self.tr > 0, f"TR must be positive, got {self.tr}"
-        assert self.n_slices > 0, "n_slices must be positive"
-        assert self.mb_factor >= 1, "mb_factor must be >= 1"
-        assert self.n_slices % self.mb_factor == 0, (
-            f"{self.n_slices} slices not divisible by MB={self.mb_factor}"
-        )
-        assert self.interp_factor >= 1, "interp_factor must be >= 1"
-        assert self.envelope_baseline in ("none", "percentile", "robust"), (
-            f"envelope_baseline must be 'none', 'percentile' or 'robust', "
-            f"got '{self.envelope_baseline}'"
-        )
-        assert self.log_compress_gain >= 0, "log_compress_gain must be >= 0"
+        """Validate configuration independent of the actual input sampling rate."""
+        if not self.vhdr_path:
+            raise ValueError("vhdr_path must be set")
+
+        if self.tr <= 0:
+            raise ValueError(f"tr must be positive, got {self.tr}")
+
+        if self.n_slices <= 0:
+            raise ValueError("n_slices must be positive")
+
+        if self.mb_factor < 1:
+            raise ValueError("mb_factor must be >= 1")
+
+        if self.interp_factor < 1:
+            raise ValueError("interp_factor must be >= 1")
+
+        if self.window_size < 1:
+            raise ValueError("window_size must be >= 1 volume")
+
+        if self.n_candidates < 1:
+            raise ValueError("n_candidates must be >= 1")
+
+        if self.time_section <= 0:
+            raise ValueError("time_section must be positive")
+
+        if not (0.0 < self.var_threshold <= 100.0):
+            raise ValueError("var_threshold must be in ]0, 100]")
+
+        if self.padding < 0:
+            raise ValueError("padding must be >= 0")
+
+        if not (0.0 <= self.zero_fill_gap_fraction <= 1.0):
+            raise ValueError("zero_fill_gap_fraction must be in [0, 1]")
+
+        if self.envelope_baseline not in ("none", "percentile", "robust"):
+            raise ValueError(
+                "envelope_baseline must be 'none', 'percentile' or 'robust', "
+                f"got '{self.envelope_baseline}'"
+            )
+
+        if self.log_compress_gain < 0:
+            raise ValueError("log_compress_gain must be >= 0")
+
+        if len(self.bandpass) != 2:
+            raise ValueError("bandpass must be a (low_hz, high_hz) tuple")
+
+        if not (0 < self.bandpass[0] < self.bandpass[1]):
+            raise ValueError(
+                f"Invalid bandpass={self.bandpass}; require 0 < low < high."
+            )
+
+    def validate_sampling_rate(self, srate: float) -> None:
+        """Validate frequency-dependent configuration after loading the data."""
+        if srate <= 0:
+            raise ValueError(f"Invalid sampling rate: {srate}")
+
+        nyquist = srate / 2.0
+
+        checks = {
+            "hpf_cutoff": self.hpf_cutoff,
+            "lpf_cutoff": self.lpf_cutoff,
+            "bandpass low": self.bandpass[0],
+            "bandpass high": self.bandpass[1],
+        }
+
+        for name, freq in checks.items():
+            if not (0.0 < freq < nyquist):
+                raise ValueError(
+                    f"{name}={freq} Hz must be strictly between 0 and "
+                    f"Nyquist ({nyquist:.3f} Hz)."
+                )
+
+        if self.hpf_cutoff >= self.lpf_cutoff:
+            raise ValueError(
+                f"hpf_cutoff ({self.hpf_cutoff}) must be below "
+                f"lpf_cutoff ({self.lpf_cutoff})."
+            )
+
+        if self.bandpass[0] >= self.bandpass[1]:
+            raise ValueError("bandpass low cutoff must be below high cutoff.")

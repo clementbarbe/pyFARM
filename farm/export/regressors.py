@@ -225,85 +225,156 @@ def make_regressor(
     tr: float,
     center_hrf: bool = True,
     log_compress_gain: float = 50.0,
+    volume_onsets_sec: np.ndarray | None = None,
 ) -> dict:
-    """Build a full set of regressors from a normalised envelope.
+    """Build regressors from a normalised EMG envelope.
 
     Parameters
     ----------
-    envelope : 1-D array — normalised [0, 1] EMG envelope.
-    fsample : float — sampling rate of *envelope*.
-    n_volumes : int — number of fMRI volumes.
-    tr : float — repetition time (s).
-    center_hrf : bool — center convolutions at quiet-period baseline.
-    log_compress_gain : float — gain for the compressive log transform.
+    envelope
+        One-dimensional corrected envelope in [0, 1].
+    fsample
+        Sampling rate of envelope.
+    n_volumes
+        Number of fMRI volumes.
+    tr
+        Nominal TR in seconds. Used when real onset times are not supplied.
+    center_hrf
+        Center HRF-convolved regressors around quiet baseline.
+    log_compress_gain
+        Compression gain for log envelope pathway.
+    volume_onsets_sec
+        Optional real scanner volume onset times, relative to the beginning
+        of the cropped EMG data. If supplied, these times are used exactly
+        for TR-level sampling.
 
     Returns
     -------
-    dict with all regressor keys.
-
-    When ``center_hrf=True``:
-    - ``conv``, ``log_conv``: baseline ≈ 0, peak = 1, undershoot < 0.
-    - ``dconv``, ``dlog_conv``: range [-1, +1], baseline ≈ 0.
-    - ``mod``, ``log_mod``, ``dmod``, ``dlog_mod``: range [0, 1].
+    dict
+        High-resolution and volume-level regressors.
     """
     ts = np.asarray(envelope, dtype=np.float64).ravel()
-    hrf = spm_hrf(1.0 / fsample)
 
-    # ── Log-compressed version of the envelope ───────────────
+    if len(ts) < 2:
+        raise ValueError("Envelope must contain at least two samples")
+
+    if fsample <= 0:
+        raise ValueError("fsample must be positive")
+
+    if n_volumes < 1:
+        raise ValueError("n_volumes must be >= 1")
+
+    hrf = spm_hrf(1.0 / fsample)
     log_ts = _log_compress(ts, gain=log_compress_gain)
 
-    # Diagnostic: show the actual difference
-    corr = float(np.corrcoef(ts, log_ts)[0, 1]) if len(ts) > 2 else 1.0
+    if np.std(ts) > 1e-20 and np.std(log_ts) > 1e-20:
+        corr = float(np.corrcoef(ts, log_ts)[0, 1])
+    else:
+        corr = 1.0
+
     logger.info(
-        "Log compression gain=%.0f: correlation(envelope, log_envelope)=%.4f "
-        "(1.0 = identical, <0.95 = good separation)",
-        log_compress_gain, corr,
+        "Log compression gain=%.0f: corr(envelope, log_envelope)=%.4f",
+        log_compress_gain,
+        corr,
     )
 
-    # ── Raw convolutions (unscaled) ──────────────────────────
-    raw_conv = fftconvolve(ts, hrf, mode="full")[: len(ts)]
-    raw_log_conv = fftconvolve(log_ts, hrf, mode="full")[: len(ts)]
+    raw_conv = fftconvolve(ts, hrf, mode="full")[:len(ts)]
+    raw_log_conv = fftconvolve(log_ts, hrf, mode="full")[:len(ts)]
 
     if center_hrf:
-        # Center using quiet periods from the ORIGINAL envelope
         conv = _center_at_quiet(raw_conv, ts)
         log_conv = _center_at_quiet(raw_log_conv, ts)
 
-        # Derivatives on centered signals
-        dconv = _scale_by_absmax(np.concatenate([[0], np.diff(conv)]))
-        dlog_conv = _scale_by_absmax(np.concatenate([[0], np.diff(log_conv)]))
-
-        logger.info(
-            "HRF centered: conv [%.3f, %.3f], log_conv [%.3f, %.3f]",
-            conv.min(), conv.max(), log_conv.min(), log_conv.max(),
-        )
+        dconv = _scale_by_absmax(np.gradient(conv, 1.0 / fsample))
+        dlog_conv = _scale_by_absmax(np.gradient(log_conv, 1.0 / fsample))
     else:
         conv = _normalize_range(raw_conv)
         log_conv = _normalize_range(raw_log_conv)
-        dconv = _normalize_range(np.concatenate([[0], np.diff(conv)]))
-        dlog_conv = _normalize_range(np.concatenate([[0], np.diff(log_conv)]))
 
-    # ── Non-convolved modulations (always [0, 1]) ────────────
+        dconv = _normalize_range(np.gradient(conv, 1.0 / fsample))
+        dlog_conv = _normalize_range(np.gradient(log_conv, 1.0 / fsample))
+
     mod_s = _normalize_range(ts)
-    log_mod = _normalize_range(log_ts)
-    dmod = _normalize_range(np.concatenate([[0], np.diff(mod_s)]))
-    dlog_mod = _normalize_range(np.concatenate([[0], np.diff(log_mod)]))
+    log_mod_full = _normalize_range(log_ts)
 
-    # ── Downsample to TR ─────────────────────────────────────
-    time_conv = np.arange(len(conv)) / fsample
-    idx = np.round(np.linspace(0, len(time_conv) - 1, n_volumes)).astype(int)
-    time_reg = time_conv[idx]
-
-    return dict(
-        conv=conv, dconv=dconv, log_conv=log_conv, dlog_conv=dlog_conv,
-        time_conv=time_conv,
-        reg=conv[idx], dreg=dconv[idx],
-        log_reg=log_conv[idx], dlog_reg=dlog_conv[idx],
-        time_reg=time_reg,
-        mod=mod_s[idx], log_mod=log_mod[idx],
-        dmod=dmod[idx], dlog_mod=dlog_mod[idx],
+    dmod_full = _normalize_range(np.gradient(mod_s, 1.0 / fsample))
+    dlog_mod_full = _normalize_range(
+        np.gradient(log_mod_full, 1.0 / fsample)
     )
 
+    time_conv = np.arange(len(conv), dtype=np.float64) / fsample
+
+    if volume_onsets_sec is None:
+        time_reg = np.arange(n_volumes, dtype=np.float64) * float(tr)
+    else:
+        time_reg = np.asarray(volume_onsets_sec, dtype=np.float64).ravel()
+
+        if len(time_reg) != n_volumes:
+            raise ValueError(
+                "volume_onsets_sec must have n_volumes entries: "
+                f"got {len(time_reg)}, expected {n_volumes}."
+            )
+
+    # np.interp avoids a rounding bias and uses the real temporal positions.
+    reg = np.interp(time_reg, time_conv, conv, left=conv[0], right=conv[-1])
+    dreg = np.interp(time_reg, time_conv, dconv, left=dconv[0], right=dconv[-1])
+
+    log_reg = np.interp(
+        time_reg,
+        time_conv,
+        log_conv,
+        left=log_conv[0],
+        right=log_conv[-1],
+    )
+    dlog_reg = np.interp(
+        time_reg,
+        time_conv,
+        dlog_conv,
+        left=dlog_conv[0],
+        right=dlog_conv[-1],
+    )
+
+    mod = np.interp(time_reg, time_conv, mod_s, left=mod_s[0], right=mod_s[-1])
+    log_mod = np.interp(
+        time_reg,
+        time_conv,
+        log_mod_full,
+        left=log_mod_full[0],
+        right=log_mod_full[-1],
+    )
+    dmod = np.interp(
+        time_reg,
+        time_conv,
+        dmod_full,
+        left=dmod_full[0],
+        right=dmod_full[-1],
+    )
+    dlog_mod = np.interp(
+        time_reg,
+        time_conv,
+        dlog_mod_full,
+        left=dlog_mod_full[0],
+        right=dlog_mod_full[-1],
+    )
+
+    return dict(
+        conv=conv,
+        dconv=dconv,
+        log_conv=log_conv,
+        dlog_conv=dlog_conv,
+        time_conv=time_conv,
+
+        reg=reg,
+        dreg=dreg,
+        log_reg=log_reg,
+        dlog_reg=dlog_reg,
+        time_reg=time_reg,
+
+        mod=mod,
+        log_mod=log_mod,
+        dmod=dmod,
+        dlog_mod=dlog_mod,
+    )
 
 # ═══════════════════════════════════════════════════════════════
 #  Per-channel .mat export
@@ -345,6 +416,7 @@ def build_and_export_regressors(
     envelope_threshold_factor: float = 2.5,
     center_hrf: bool = True,
     log_compress_gain: float = 50.0,
+    volume_onsets_sec: np.ndarray | None = None,
 ) -> dict:
     """Build EMG regressors for all channels and write to disk."""
     out = Path(output_dir)
@@ -386,9 +458,13 @@ def build_and_export_regressors(
             fs_reg = float(srate)
 
         reginfo = make_regressor(
-            envelope_ds, fs_reg, n_vol, tr,
+            envelope_ds,
+            fs_reg,
+            n_vol,
+            tr,
             center_hrf=center_hrf,
             log_compress_gain=log_compress_gain,
+            volume_onsets_sec=volume_onsets_sec,
         )
         all_regressors[ch_name] = reginfo
 

@@ -1,4 +1,6 @@
-"""Pipeline configuration dataclass."""
+"""Configuration for the pure pyFARM denoising pipeline."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,137 +10,106 @@ import math
 
 @dataclass
 class FARMConfig:
-    """All user-facing parameters for a single FARM run."""
+    """User-facing parameters for one EMG-fMRI denoising run.
 
-    # ── Input ────────────────────────────────────────────────
+    The package deliberately stops at denoising.  Envelope extraction,
+    normalisation, HRF convolution, and SPM regressor construction belong to
+    the separate ``emg-regressors`` tool.
+    """
+
     vhdr_path: str = ""
 
-    # ── EPI sequence ─────────────────────────────────────────
+    # EPI sequence
     tr: float = 1.6
     n_slices: int = 54
     mb_factor: int = 3
     trigger: str = "R128"
     ch_regex: str = r"EXT|FLE"
 
-    # ── Processing ───────────────────────────────────────────
+    # FARM processing
     interp_factor: int = 10
-
-    # window_size is now in VOLUMES, not in arbitrary global slices.
-    # For each slice-group, templates can use ±window_size nearby volumes.
-    window_size: int = 50
-
+    window_size: int = 50       # candidate window in volumes
     n_candidates: int = 12
     n_volumes: Optional[int] = None
     drop_last_volume: bool = False
-
     time_section: float = 60.0
     var_threshold: float = 5.0
 
-    # Core EMG branch.  Timing and template estimation use the same HPF
-    # branch as the proven legacy pipeline; this avoids selecting a different
-    # timing minimum merely because of a separate reference filter.
+    # Artifact / timing branches.  The validated protocol uses the same HPF
+    # for both, reproducing the stable timing minimum of the legacy pipeline.
     artifact_hpf_cutoff: float = 30.0
     timing_hpf_cutoff: float = 30.0
 
-    # Global section-wise PCA.  The experimental group-wise PCA produced
-    # hundreds of independent fits and slice-periodic spectral structure.
+    # Artifact-specific global PCA
     pca_artifact_corr_threshold: float = 0.10
     pca_mean_corr_threshold: float = 0.10
     pca_mean_repeatability_threshold: float = 0.20
     pca_max_components: int = 6
     pca_groupwise: bool = False
 
-    # Template defaults intentionally reproduce legacy FARM behaviour while
-    # retaining the corrected full window for the last acquisition group.
+    # Adaptive template construction.  These defaults preserve the validated
+    # FARM-like top-N arithmetic mean while keeping the corrected last-group
+    # correlation window.
     template_trim_fraction: float = 0.0
     template_min_correlation: float = -1.0
     template_scale_bounds: Optional[Tuple[float, float]] = None
 
-    bandpass: Tuple[float, float] = (30.0, 250.0)
-    hpf_cutoff: float = 30.0  # retained for backward compatibility / QC
-    # Legacy compatibility only: the core cleaned waveform is no longer
-    # post-filtered at this cutoff. Use ``bandpass`` for the derived EMG band.
-    lpf_cutoff: float = 250.0
     padding: int = 10
 
-    # Preserve the inter-volume dead-time by default.  Set >0 only when a
-    # dataset has demonstrated boundary contamination that must be masked.
+    # Generic default is conservative.  For protocols with a demonstrated
+    # scanner-locked boundary artifact (such as the supplied dataset), set 1.0.
     zero_fill_gap_fraction: float = 0.0
 
-    # ── Envelope baseline correction ─────────────────────────
-    envelope_baseline: str = "robust"
-    envelope_percentile: float = 10.0
-    envelope_window_sec: float = 30.0
-    envelope_threshold_factor: float = 2.5
+    # QC band only.  It NEVER modifies the exported denoised waveform.
+    qc_bandpass: Tuple[float, float] = (30.0, 250.0)
 
-    # ── HRF centering + log compression ──────────────────────
-    center_hrf: bool = True
-    log_compress_gain: float = 50.0
-
-    # ── Output ───────────────────────────────────────────────
-    output_dir: str = "output"
+    # Output
+    output_dir: str = "denoised"
     figures_dir: Optional[str] = None
+    output_suffix: str = "_FARM"
 
     @property
     def n_sg(self) -> int:
-        """Number of acquisition slice-groups per volume.
-
-        ceil() deliberately supports protocols such as:
-        - 53 anatomical slices
-        - multiband factor 3
-        - 18 slice-group acquisition events
-
-        The final multiband group may contain fewer anatomical slices, but
-        it remains one acquisition event and therefore one gradient artifact.
-        """
+        """Number of multiband acquisition groups per volume."""
         return int(math.ceil(self.n_slices / self.mb_factor))
 
     @property
     def figures_enabled(self) -> bool:
         return self.figures_dir != ""
 
-    def get_figures_dir(self) -> Path | None:
-        """Return/create figures directory, or None if figures are disabled."""
+    def get_figures_dir(self, basename: str | None = None) -> Path | None:
         if self.figures_dir == "":
             return None
-
         if self.figures_dir is None:
             p = Path(self.output_dir) / "figures"
+            if basename:
+                p = p / basename
         else:
             p = Path(self.figures_dir)
-
+            if basename:
+                p = p / basename
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def validate(self) -> None:
-        """Validate configuration independent of the actual input sampling rate."""
         if not self.vhdr_path:
             raise ValueError("vhdr_path must be set")
-
         if self.tr <= 0:
-            raise ValueError(f"tr must be positive, got {self.tr}")
-
+            raise ValueError("tr must be positive")
         if self.n_slices <= 0:
             raise ValueError("n_slices must be positive")
-
         if self.mb_factor < 1:
             raise ValueError("mb_factor must be >= 1")
-
         if self.interp_factor < 1:
             raise ValueError("interp_factor must be >= 1")
-
         if self.window_size < 1:
             raise ValueError("window_size must be >= 1 volume")
-
         if self.n_candidates < 1:
             raise ValueError("n_candidates must be >= 1")
-
         if self.time_section <= 0:
             raise ValueError("time_section must be positive")
-
         if not (0.0 < self.var_threshold <= 100.0):
             raise ValueError("var_threshold must be in ]0, 100]")
-
         if not (0.0 <= self.pca_artifact_corr_threshold <= 1.0):
             raise ValueError("pca_artifact_corr_threshold must be in [0, 1]")
         if not (0.0 <= self.pca_mean_corr_threshold <= 1.0):
@@ -147,7 +118,6 @@ class FARMConfig:
             raise ValueError("pca_mean_repeatability_threshold must be >= 0")
         if self.pca_max_components < 0:
             raise ValueError("pca_max_components must be >= 0")
-
         if not (0.0 <= self.template_trim_fraction < 0.5):
             raise ValueError("template_trim_fraction must be in [0, 0.5)")
         if not (-1.0 <= self.template_min_correlation <= 1.0):
@@ -157,58 +127,29 @@ class FARMConfig:
                 self.template_scale_bounds[0] < self.template_scale_bounds[1]
             ):
                 raise ValueError("template_scale_bounds must be None or (min, max)")
-
         if self.padding < 0:
             raise ValueError("padding must be >= 0")
-
         if not (0.0 <= self.zero_fill_gap_fraction <= 1.0):
             raise ValueError("zero_fill_gap_fraction must be in [0, 1]")
-
-        if self.envelope_baseline not in ("none", "percentile", "robust"):
-            raise ValueError(
-                "envelope_baseline must be 'none', 'percentile' or 'robust', "
-                f"got '{self.envelope_baseline}'"
-            )
-
-        if self.log_compress_gain < 0:
-            raise ValueError("log_compress_gain must be >= 0")
-
-        if len(self.bandpass) != 2:
-            raise ValueError("bandpass must be a (low_hz, high_hz) tuple")
-
-        if not (0 < self.bandpass[0] < self.bandpass[1]):
-            raise ValueError(
-                f"Invalid bandpass={self.bandpass}; require 0 < low < high."
-            )
+        if len(self.qc_bandpass) != 2 or not (
+            0.0 < self.qc_bandpass[0] < self.qc_bandpass[1]
+        ):
+            raise ValueError("qc_bandpass must be (low, high) with 0 < low < high")
+        if not self.output_suffix:
+            raise ValueError("output_suffix must not be empty")
 
     def validate_sampling_rate(self, srate: float) -> None:
-        """Validate frequency-dependent configuration after loading the data."""
         if srate <= 0:
             raise ValueError(f"Invalid sampling rate: {srate}")
-
         nyquist = srate / 2.0
-
-        checks = {
-            "hpf_cutoff": self.hpf_cutoff,
+        for name, freq in {
             "artifact_hpf_cutoff": self.artifact_hpf_cutoff,
             "timing_hpf_cutoff": self.timing_hpf_cutoff,
-            "lpf_cutoff": self.lpf_cutoff,
-            "bandpass low": self.bandpass[0],
-            "bandpass high": self.bandpass[1],
-        }
-
-        for name, freq in checks.items():
+            "qc_band low": self.qc_bandpass[0],
+            "qc_band high": self.qc_bandpass[1],
+        }.items():
             if not (0.0 < freq < nyquist):
                 raise ValueError(
-                    f"{name}={freq} Hz must be strictly between 0 and "
-                    f"Nyquist ({nyquist:.3f} Hz)."
+                    f"{name}={freq} Hz must be strictly between 0 and Nyquist "
+                    f"({nyquist:.3f} Hz)."
                 )
-
-        if self.hpf_cutoff >= self.lpf_cutoff:
-            raise ValueError(
-                f"hpf_cutoff ({self.hpf_cutoff}) must be below "
-                f"lpf_cutoff ({self.lpf_cutoff})."
-            )
-
-        if self.bandpass[0] >= self.bandpass[1]:
-            raise ValueError("bandpass low cutoff must be below high cutoff.")

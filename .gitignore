@@ -1,8 +1,14 @@
-# Ignorer tous les dossiers commençant par un point
-.*/
-
-# Ignorer les dossiers __pycache__ (Python)
 __pycache__/
-
-# Ignorer tout le contenu du dossier output/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
 output/
+denoised/
+figures/
+data/
+.DS_Store

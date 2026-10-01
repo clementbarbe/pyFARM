@@ -9,9 +9,6 @@ from .timeseries import (
     plot_slice_marker_diagnostics, plot_session_comparison,
     plot_full_signal_overview,
 )
-from .regressors import (
-    plot_regressor, plot_regressor_panels, plot_envelope_correction,
-)
 
 __all__ = [
     "savefig",
@@ -21,5 +18,4 @@ __all__ = [
     "plot_raw_channels", "plot_ivi", "plot_timing_diagnostics",
     "plot_slice_marker_diagnostics", "plot_session_comparison",
     "plot_full_signal_overview",
-    "plot_regressor", "plot_regressor_panels", "plot_envelope_correction",
 ]

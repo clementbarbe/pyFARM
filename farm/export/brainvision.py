@@ -18,32 +18,24 @@ def export_brainvision(
 ) -> str:
     """Write a BrainVision file set with cleaned selected channels.
 
-    All original channels are retained and only selected EMG channels are
-    replaced. Original annotations are copied and first_samp is preserved.
+    All original channels are retained; only selected EMG channels are
+    replaced.  Original annotations are preserved.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
     vhdr_path = str(out / f"{basename}.vhdr")
 
     clean = np.asarray(data_clean_full)
-
     if clean.ndim != 2:
         raise ValueError("data_clean_full must have shape (n_channels, n_samples)")
-
     if clean.shape[0] != len(ch_indices):
-        raise ValueError(
-            "data_clean_full channel count and ch_indices length do not match"
-        )
-
+        raise ValueError("data_clean_full channel count and ch_indices length do not match")
     if clean.shape[1] != raw_original.n_times:
         raise ValueError(
-            f"Cleaned data has {clean.shape[1]} samples but Raw has "
-            f"{raw_original.n_times} samples."
+            f"Cleaned data has {clean.shape[1]} samples but Raw has {raw_original.n_times}."
         )
 
     raw_data = raw_original.get_data().copy()
-
     for local_index, raw_channel_index in enumerate(ch_indices):
         raw_data[raw_channel_index] = clean[local_index].astype(np.float64)
 
@@ -53,24 +45,17 @@ def export_brainvision(
         first_samp=raw_original.first_samp,
         verbose=False,
     )
-
     raw_export.set_annotations(raw_original.annotations.copy())
 
     try:
-        mne.export.export_raw(
-            vhdr_path,
-            raw_export,
-            overwrite=True,
-            verbose=False,
-        )
+        mne.export.export_raw(vhdr_path, raw_export, overwrite=True, verbose=False)
     except RuntimeError as exc:
-        if "pybv" not in str(exc).lower():
-            raise
-        logger.warning(
-            "BrainVision export skipped because optional dependency 'pybv' "
-            "is not installed. NPZ/MAT exports will still be written."
-        )
-        return ""
+        if "pybv" in str(exc).lower():
+            raise RuntimeError(
+                "BrainVision export requires 'pybv'. Install the project with "
+                "`python -m pip install -e .` (pybv is a required dependency)."
+            ) from exc
+        raise
 
     logger.info("BrainVision exported: %s", vhdr_path)
     return vhdr_path

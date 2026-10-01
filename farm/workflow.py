@@ -52,8 +52,7 @@ from farm.diagnostics.metrics import (
 
 # ── Export ───────────────────────────────────────────────────
 from farm.export.brainvision import export_brainvision
-from farm.export.arrays import export_npz, export_mat
-from farm.export.regressors import build_and_export_regressors
+from farm.export.metadata import export_metadata
 
 
 logger = logging.getLogger("farm.workflow")
@@ -306,15 +305,14 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     -------
     dict
         Contains cleaned data, timing parameters, trigger positions,
-        regressor information, QC metrics, and output metadata.
+        QC metrics, and output metadata.
     """
     cfg.validate()
 
     t_total = time.time()
 
-    run_name = Path(cfg.vhdr_path).stem + "_FARM"
-    cfg.output_dir = str(Path(cfg.output_dir) / run_name)
-    basename = run_name
+    basename = Path(cfg.vhdr_path).stem + cfg.output_suffix
+    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
     # ────────────────────────────────────────────────────────
     # Resolve figure output directory
@@ -322,7 +320,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     fig_dir: Path | None = None
 
     if cfg.figures_enabled:
-        fig_dir = cfg.get_figures_dir()
+        fig_dir = cfg.get_figures_dir(basename)
         logger.info("Figures will be saved to: %s", fig_dir)
 
     # ────────────────────────────────────────────────────────
@@ -659,15 +657,17 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         )
 
     # ────────────────────────────────────────────────────────
-    # 12. Downsample core FARM output, then impose EMG band ONCE
+    # 12. Downsample pure FARM output
     # ────────────────────────────────────────────────────────
     banner("POST-PROCESSING", "📉")
 
     t0 = time.time()
 
-    # resample_poly performs the anti-alias filtering needed for decimation.
-    # No explicit 250-Hz LPF is applied before downsampling.
-    data_clean_broadband_crop = downsample(
+    # resample_poly supplies the anti-alias filtering needed for decimation.
+    # No analysis-band HPF/LPF is imposed here: the exported waveform remains
+    # the broadband FARM result.  This cleanly separates denoising from later
+    # EMG feature/regressor construction.
+    data_clean_crop = downsample(
         data_up=data_science_up,
         srate_up=srate_up,
         factor=cfg.interp_factor,
@@ -675,24 +675,20 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     )
     del data_science_up, data_artifact_up
 
-    # The physiologically interpretable output for this acquisition is the
-    # configured EMG band.  Apply it exactly once at native sampling rate.
-    data_before_emg_band = apply_bandpass(data_raw_trim, srate, cfg.bandpass)
-    data_clean_emg_band = apply_bandpass(
-        data_clean_broadband_crop, srate, cfg.bandpass
-    )
-    data_clean_crop = data_clean_emg_band
-
-    # Primary BrainVision output: untouched signal outside the scan and the
-    # final EMG-band FARM result inside the scan.  The broadband core remains
-    # available in NPZ/MAT for diagnostics.
+    # Reconstruct the full recording.  Outside the fMRI scan crop, data are
+    # untouched; inside it, only the selected EMG channels are FARM-cleaned.
     data_clean_full = data_full_raw.copy()
-    data_clean_full[:, s_trim:e_trim] = data_clean_emg_band
+    data_clean_full[:, s_trim:e_trim] = data_clean_crop
+
+    # QC is intentionally performed in a configured EMG band, but this branch
+    # is diagnostic only and never replaces the exported broadband data.
+    data_before_qc = apply_bandpass(data_raw_trim, srate, cfg.qc_bandpass)
+    data_after_qc = apply_bandpass(data_clean_crop, srate, cfg.qc_bandpass)
 
     logger.info(
-        "Post-processing done in %.2f s — FARM core retained separately; "
-        "final EMG output filtered once at %.1f–%.1f Hz",
-        time.time() - t0, cfg.bandpass[0], cfg.bandpass[1],
+        "Post-processing done in %.2f s — broadband FARM output preserved; "
+        "QC evaluated at %.1f–%.1f Hz",
+        time.time() - t0, cfg.qc_bandpass[0], cfg.qc_bandpass[1],
     )
 
     # ────────────────────────────────────────────────────────
@@ -701,15 +697,15 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("FINAL DIAGNOSTICS", "📊")
 
     rms_results = compute_rms_reduction(
-        data_before=data_before_emg_band,
-        data_after=data_clean_emg_band,
+        data_before=data_before_qc,
+        data_after=data_after_qc,
         srate=srate,
         ch_names=ch_names,
         bandpass=None,
     )
     scanner_locked_results = compute_scanner_locked_reduction(
-        data_before=data_before_emg_band,
-        data_after=data_clean_emg_band,
+        data_before=data_before_qc,
+        data_after=data_after_qc,
         srate=srate,
         ch_names=ch_names,
         vol_onsets=vol_onsets,
@@ -733,78 +729,44 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         for ch_i in range(n_ch):
             name = ch_names[ch_i]
 
-            # Main spectral QC uses exactly the same 30–250 Hz analysis band
-            # on before/after signals.  Broadband core data are still exported.
-            plot_fft_power(
-                data_clean_emg_band[ch_i],
-                srate,
-                name,
-                fig_dir,
-            )
-
+            # Main artifact-removal diagnostics use identical QC preprocessing
+            # before/after.  This prevents the plot itself from introducing an
+            # apparent spectral difference.
+            plot_fft_power(data_after_qc[ch_i], srate, name, fig_dir)
             plot_fft_before_after(
-                data_before_emg_band[ch_i],
-                data_clean_emg_band[ch_i],
-                srate,
-                name,
-                fig_dir,
-                sdur,
+                data_before_qc[ch_i], data_after_qc[ch_i],
+                srate, name, fig_dir, sdur,
             )
-
             plot_psd_welch_before_after(
-                data_before_emg_band[ch_i],
-                data_clean_emg_band[ch_i],
-                srate,
-                name,
-                fig_dir,
+                data_before_qc[ch_i], data_after_qc[ch_i],
+                srate, name, fig_dir,
             )
-
             plot_spectrogram_comparison(
-                data_before_emg_band[ch_i],
-                data_clean_emg_band[ch_i],
-                srate,
-                name,
-                fig_dir,
+                data_before_qc[ch_i], data_after_qc[ch_i],
+                srate, name, fig_dir,
             )
-
             plot_session_comparison(
-                data_before_emg_band[ch_i],
-                data_clean_emg_band[ch_i],
-                srate,
-                name,
-                fig_dir,
-                bandpass=None,
+                data_before_qc[ch_i], data_after_qc[ch_i],
+                srate, name, fig_dir, bandpass=None,
             )
-
             plot_carpet_comparison(
-                data_before=data_before_emg_band[ch_i],
-                data_after=data_clean_emg_band[ch_i],
-                srate=srate,
-                ch_name=name,
-                vol_onsets=vol_onsets,
-                sdur=sdur,
-                n_sg=cfg.n_sg,
-                n_vol=n_vol,
-                fig_dir=fig_dir,
-                bandpass=None,
+                data_before=data_before_qc[ch_i],
+                data_after=data_after_qc[ch_i],
+                srate=srate, ch_name=name, vol_onsets=vol_onsets,
+                sdur=sdur, n_sg=cfg.n_sg, n_vol=n_vol,
+                fig_dir=fig_dir, bandpass=None,
             )
-
             plot_full_signal_overview(
-                data_full_raw[ch_i],
-                data_clean_full[ch_i],
-                srate,
-                name,
-                s_trim,
-                e_trim,
-                fig_dir,
+                data_full_raw[ch_i], data_clean_full[ch_i],
+                srate, name, s_trim, e_trim, fig_dir,
             )
 
     # ────────────────────────────────────────────────────────
-    # 14. Export cleaned signal arrays
+    # 14. Export pure denoised BrainVision + compact sidecar
     # ────────────────────────────────────────────────────────
     banner("EXPORT", "💾")
 
-    export_brainvision(
+    brainvision_path = export_brainvision(
         raw_original=raw_original,
         data_clean_full=data_clean_full,
         ch_indices=ch_indices,
@@ -812,86 +774,42 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         basename=basename,
     )
 
-    export_npz(
-        cfg.output_dir,
-        basename,
-        clean_full=data_clean_full,
-        clean_broadband_crop=data_clean_broadband_crop,
-        clean_emg_band=data_clean_emg_band,
-        raw_trim=data_raw_trim,
-        pca_clean=data_clean_emg_band,
-        hpf_data=data_hpf,
-        ch_names=np.array(ch_names),
-        srate=srate,
-        vol_onsets=vol_onsets,
-        vol_onsets_abs=vol_onsets_abs,
-        volume_onsets_sec=volume_onsets_sec,
-        s_trim=s_trim,
-        e_trim=e_trim,
-        sdur=sdur,
-        dtime=dtime,
-        tr=cfg.tr,
-        observed_tr=observed_tr,
-        n_sg=cfg.n_sg,
-        n_vol=n_vol,
-        zero_fill_gap_fraction=cfg.zero_fill_gap_fraction,
-    )
-
-    export_mat(
-        cfg.output_dir,
-        basename,
-        clean_full=data_clean_full,
-        clean_broadband_crop=data_clean_broadband_crop,
-        clean_emg_band=data_clean_emg_band,
-        raw_trim=data_raw_trim,
-        pca_clean=data_clean_emg_band,
-        hpf_data=data_hpf,
-        ch_names=np.array(ch_names, dtype=object),
-        srate=srate,
-        vol_onsets=vol_onsets,
-        vol_onsets_abs=vol_onsets_abs,
-        volume_onsets_sec=volume_onsets_sec,
-        s_trim=s_trim,
-        e_trim=e_trim,
-        sdur=sdur,
-        dtime=dtime,
-        tr=cfg.tr,
-        observed_tr=observed_tr,
-        n_sg=cfg.n_sg,
-        n_vol=n_vol,
-        zero_fill_gap_fraction=cfg.zero_fill_gap_fraction,
-        time_full=np.arange(n_samples_full, dtype=np.float64) / srate,
-        time_crop=np.arange(n_samples_orig, dtype=np.float64) / srate,
-    )
-
-    # ────────────────────────────────────────────────────────
-    # 15. Build EMG regressors
-    # ────────────────────────────────────────────────────────
-    banner("EMG REGRESSORS", "📉")
-
-    all_regressors = build_and_export_regressors(
-        data_clean_crop=data_clean_emg_band,
-        srate=srate,
-        ch_names=ch_names,
-        n_vol=n_vol,
-        tr=cfg.tr,
-        volume_onsets_sec=volume_onsets_sec,
-        bandpass=None,
-        output_dir=cfg.output_dir,
-        basename=basename,
-        fig_dir=fig_dir,
-        envelope_baseline=cfg.envelope_baseline,
-        envelope_percentile=cfg.envelope_percentile,
-        envelope_window_sec=cfg.envelope_window_sec,
-        envelope_threshold_factor=cfg.envelope_threshold_factor,
-        center_hrf=cfg.center_hrf,
-        log_compress_gain=cfg.log_compress_gain,
-    )
+    metadata = {
+        "format_version": 1,
+        "kind": "pyFARM-denoise",
+        "config": dict(cfg.__dict__),
+        "input_vhdr": str(Path(cfg.vhdr_path).resolve()),
+        "output_vhdr": brainvision_path,
+        "output_is_broadband_farm": True,
+        "selected_channels": ch_names,
+        "sampling_rate_hz": srate,
+        "tr_seconds": cfg.tr,
+        "n_slices": cfg.n_slices,
+        "mb_factor": cfg.mb_factor,
+        "n_slice_groups": cfg.n_sg,
+        "trigger": cfg.trigger,
+        "n_volumes": n_vol,
+        "drop_last_volume": cfg.drop_last_volume,
+        "scan_start_sample": s_trim,
+        "scan_stop_sample_exclusive": e_trim,
+        "volume_onsets_samples_full": vol_onsets_abs,
+        "volume_onsets_samples_crop": vol_onsets,
+        "sdur_seconds": sdur,
+        "dtime_seconds": dtime,
+        "observed_tr_seconds": observed_tr,
+        "reconstructed_tr_seconds": reconstructed_tr,
+        "zero_fill_gap_fraction": cfg.zero_fill_gap_fraction,
+        "qc_bandpass_hz": cfg.qc_bandpass,
+        "rms_reduction": rms_results,
+        "scanner_locked_reduction": scanner_locked_results,
+    }
+    metadata_path = export_metadata(cfg.output_dir, basename, metadata)
+    logger.info("Denoising sidecar: %s", metadata_path)
 
     # ────────────────────────────────────────────────────────
     # Summary
     # ────────────────────────────────────────────────────────
-    banner("PIPELINE COMPLETE", "🏁")
+    banner("DENOISING COMPLETE", "🏁")
 
     info_table([
         ("Complete volumes", f"{n_vol}"),
@@ -901,18 +819,17 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         ("Observed TR", f"{observed_tr * 1e3:.4f} ms"),
         ("Reconstructed TR", f"{reconstructed_tr * 1e3:.4f} ms"),
         ("Zero-filled gap fraction", f"{cfg.zero_fill_gap_fraction:.2f}"),
+        ("Exported signal", "broadband FARM (no regressor preprocessing)"),
         ("Total time", f"{time.time() - t_total:.1f} s"),
         ("Output", str(Path(cfg.output_dir).resolve())),
         ("Figures", str(fig_dir) if fig_dir else "disabled"),
     ])
 
-    ok("Pipeline complete.")
+    ok("Denoising complete.")
 
     return {
         "data_clean_full": data_clean_full,
-        "data_clean_crop": data_clean_emg_band,
-        "data_clean_broadband_crop": data_clean_broadband_crop,
-        "data_clean_emg_band": data_clean_emg_band,
+        "data_clean_crop": data_clean_crop,
         "data_hpf": data_hpf,
         "data_raw_trim": data_raw_trim,
         "data_full_raw": data_full_raw,
@@ -932,7 +849,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "raw_original": raw_original,
         "rms_results": rms_results,
         "scanner_locked_results": scanner_locked_results,
-        "regressors": all_regressors,
         "figures_dir": fig_dir,
         "output_dir": cfg.output_dir,
+        "brainvision_path": brainvision_path,
+        "metadata_path": metadata_path,
     }

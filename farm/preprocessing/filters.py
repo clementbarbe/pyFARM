@@ -25,11 +25,9 @@ def hpf_fir(x: np.ndarray, srate: float, cutoff: float) -> np.ndarray:
         [0, 0, 1, 1],
         fs=srate,
     )
-    out = np.empty_like(x)
-    for ch in range(x.shape[0]):
-        padlen = min(3 * numtaps, x.shape[1] - 1)
-        out[ch] = sig.filtfilt(h, 1.0, x[ch], padlen=padlen).astype(x.dtype)
-    return out
+    padlen = min(3 * numtaps, x.shape[-1] - 1)
+    out = sig.filtfilt(h, 1.0, x, axis=-1, padlen=padlen)
+    return out.astype(x.dtype, copy=False)
 
 
 def hpf_butter_1d(x: np.ndarray, srate: float, cutoff: float) -> np.ndarray:
@@ -46,24 +44,17 @@ def lpf_butter(x: np.ndarray, srate: float, cutoff: float) -> np.ndarray:
     x : ndarray, shape ``(n_channels, n_samples)``.
     """
     sos = sig.butter(4, cutoff, btype="low", fs=srate, output="sos")
-    out = np.empty_like(x)
-    for ch in range(x.shape[0]):
-        out[ch] = sig.sosfiltfilt(sos, x[ch]).astype(x.dtype)
-    return out
+    out = sig.sosfiltfilt(sos, x, axis=-1)
+    return out.astype(x.dtype, copy=False)
 
 
 def apply_bandpass(data_1d: np.ndarray, srate: float,
-                   bandpass: tuple) -> np.ndarray:
+                   bandpass: tuple | None) -> np.ndarray:
     """Convenience band-pass (Butterworth order 4, zero-phase).
 
-    Parameters
-    ----------
-    data_1d : 1-D signal.
-    bandpass : ``(low_hz, high_hz)`` or *None* to skip.
-
-    Returns
-    -------
-    Filtered signal as float32.
+    Accepts either a 1-D signal or an array whose last axis is time.  Using
+    the same function for raw and cleaned arrays guarantees a symmetric QC
+    path.  ``bandpass=None`` returns an unfiltered float32 copy.
     """
     ts = data_1d.astype(np.float64)
     if bandpass:

@@ -405,7 +405,7 @@ def build_and_export_regressors(
     ch_names: list,
     n_vol: int,
     tr: float,
-    bandpass: tuple,
+    bandpass: tuple | None,
     output_dir: str,
     basename: str,
     fig_dir: Path | None = None,
@@ -418,7 +418,12 @@ def build_and_export_regressors(
     log_compress_gain: float = 50.0,
     volume_onsets_sec: np.ndarray | None = None,
 ) -> dict:
-    """Build EMG regressors for all channels and write to disk."""
+    """Build EMG regressors for all channels and write to disk.
+
+    ``bandpass=None`` means the input is already in the desired EMG analysis
+    band.  This is used by the main workflow to guarantee that the final
+    30–250 Hz analysis branch is filtered exactly once.
+    """
     out = Path(output_dir)
     reg_dir = out / "regressors"
     reg_dir.mkdir(parents=True, exist_ok=True)

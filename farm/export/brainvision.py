@@ -56,12 +56,21 @@ def export_brainvision(
 
     raw_export.set_annotations(raw_original.annotations.copy())
 
-    mne.export.export_raw(
-        vhdr_path,
-        raw_export,
-        overwrite=True,
-        verbose=False,
-    )
+    try:
+        mne.export.export_raw(
+            vhdr_path,
+            raw_export,
+            overwrite=True,
+            verbose=False,
+        )
+    except RuntimeError as exc:
+        if "pybv" not in str(exc).lower():
+            raise
+        logger.warning(
+            "BrainVision export skipped because optional dependency 'pybv' "
+            "is not installed. NPZ/MAT exports will still be written."
+        )
+        return ""
 
     logger.info("BrainVision exported: %s", vhdr_path)
     return vhdr_path

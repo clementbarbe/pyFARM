@@ -45,7 +45,7 @@ def plot_carpet_comparison(
 
     seg_len = int(round(sdur * srate))
     for stage, arr, suffix in [
-        ("BEFORE (HPF)", data_before, "before"),
+        ("BEFORE", data_before, "before"),
         ("AFTER FARM", data_after, "after"),
     ]:
         ts = apply_bandpass(arr, srate, bandpass) if bandpass else arr

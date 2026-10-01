@@ -20,19 +20,19 @@ from farm.workflow import run_pipeline
 
 
 cfg = FARMConfig(
-    vhdr_path="data/me3mb3_tr1600_sl53.vhdr",
+    vhdr_path="data/me3mb3_tr1600_sl54.vhdr",
 
     # Scanner sequence
     tr=1.6,
-    n_slices=53,
+    n_slices=54,
     mb_factor=3,
 
-    # 53 / 3 => 18 acquisition slice-groups:
-    # 17 complete MB groups + one final potentially partial group.
+    # 54 / 3 => 18 acquisition slice-groups:
+    # 18 complete MB groups.
     trigger="R128",
 
     # EMG channel selection
-    ch_regex=r"ZYG|COR",
+    ch_regex=r"EXT|FLE",
 
     # Template candidates within +/- 50 volumes, same slice-group only
     window_size=50,
@@ -40,6 +40,11 @@ cfg = FARMConfig(
 
     # Set True only if final scanner volume is known to be incomplete.
     drop_last_volume=True,
+
+    # This protocol shows a strong scanner-locked boundary artifact in the
+    # true inter-volume dead-time.  Mask the complete measured gap, matching
+    # the behaviour that gave the cleanest spectrum on the supplied dataset.
+    zero_fill_gap_fraction=1.0,
 
     output_dir="output",
 )

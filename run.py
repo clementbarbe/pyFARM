@@ -63,6 +63,20 @@ def parse_args():
                     help="PCA section length (s)")
     p.add_argument("--var-threshold", type=float, default=5.0,
                     help="PCA variance threshold (%%)")
+    p.add_argument("--artifact-hpf", type=float, default=30.0,
+                    help="HPF used only for artifact-template estimation (Hz)")
+    p.add_argument("--timing-hpf", type=float, default=30.0,
+                    help="HPF used only for timing/reference estimation (Hz)")
+    p.add_argument("--template-min-corr", type=float, default=-1.0,
+                    help="Minimum template correlation (-1 keeps legacy top-N behaviour)")
+    p.add_argument("--template-trim", type=float, default=0.0,
+                    help="Template trim fraction (0 = legacy arithmetic mean)")
+    p.add_argument("--pca-artifact-corr", type=float, default=0.10,
+                    help="Minimum artifact-likeness correlation for PCA removal")
+    p.add_argument("--pca-max-components", type=int, default=6,
+                    help="Maximum PCA components removed per 60-s section")
+    p.add_argument("--zero-fill-gap-fraction", type=float, default=0.0,
+                    help="Fraction of true inter-volume gap to zero (default 0 preserves EMG)")
     p.add_argument("--envelope-baseline", default="robust",
                     choices=["none", "percentile", "robust"],
                     help="Envelope baseline correction method")
@@ -115,6 +129,13 @@ def main():
         drop_last_volume=args.drop_last_volume,
         time_section=args.time_section,
         var_threshold=args.var_threshold,
+        artifact_hpf_cutoff=args.artifact_hpf,
+        timing_hpf_cutoff=args.timing_hpf,
+        template_min_correlation=args.template_min_corr,
+        template_trim_fraction=args.template_trim,
+        pca_artifact_corr_threshold=args.pca_artifact_corr,
+        pca_max_components=args.pca_max_components,
+        zero_fill_gap_fraction=args.zero_fill_gap_fraction,
         envelope_baseline=args.envelope_baseline,
         envelope_percentile=args.envelope_percentile,
         envelope_window_sec=args.envelope_window,

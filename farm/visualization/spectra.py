@@ -12,6 +12,25 @@ from scipy import signal as sig
 from .plotting import savefig
 
 
+def _windowed_fft_db(ts: np.ndarray) -> np.ndarray:
+    """Return a Hann-windowed one-sided amplitude spectrum in dB.
+
+    Detrending + a Hann window strongly reduces leakage from crop boundaries
+    and residual DC offsets.  The coherent-gain normalization keeps before/
+    after overlays directly comparable when the signals have equal length.
+    """
+    x = np.asarray(ts, dtype=np.float64)
+    if x.ndim != 1:
+        x = np.ravel(x)
+    if len(x) < 2:
+        return np.full(1, -400.0, dtype=np.float64)
+    x = sig.detrend(x, type="constant")
+    win = np.hanning(len(x))
+    denom = max(float(win.sum()), 1e-30)
+    amp = np.abs(np.fft.rfft(x * win)) / denom
+    return 20.0 * np.log10(amp + 1e-20)
+
+
 def plot_psd_comparison(
     data_before: np.ndarray,
     data_after: np.ndarray,
@@ -52,8 +71,8 @@ def plot_fft_power(
     """FFT power (linear + dB) of the cleaned signal."""
     N = len(data_clean)
     freqs = np.fft.rfftfreq(N, d=1.0 / srate)
-    fft_mag = np.abs(np.fft.rfft(data_clean.astype(np.float64))) / N
-    power = fft_mag ** 2
+    db = _windowed_fft_db(data_clean)
+    power = 10.0 ** (db / 10.0)
     mask = freqs <= xlim
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 5))
@@ -62,8 +81,7 @@ def plot_fft_power(
     axes[0].set_title(f"FFT Power (linear) — {ch_name}")
     axes[0].set_xlim([0, xlim])
 
-    axes[1].plot(freqs[mask], 10 * np.log10(power[mask] + 1e-20),
-                 linewidth=0.3, color="#2ca02c")
+    axes[1].plot(freqs[mask], db[mask], linewidth=0.3, color="#2ca02c")
     axes[1].set_xlabel("Hz"); axes[1].set_ylabel("Power (dB)")
     axes[1].set_title(f"FFT Power (dB) — {ch_name}")
     axes[1].set_xlim([0, xlim])
@@ -81,12 +99,12 @@ def plot_fft_before_after(
     xlim: float = 375.0,
 ) -> None:
     """FFT dB plots: separate panels then overlay."""
+    if len(ts_before) != len(ts_after):
+        raise ValueError("Before/after FFT signals must have the same length")
     N = len(ts_before)
     freqs = np.fft.rfftfreq(N, d=1.0 / srate)
-    db_b = 20 * np.log10(
-        np.abs(np.fft.rfft(ts_before.astype(np.float64))) / N + 1e-20)
-    db_a = 20 * np.log10(
-        np.abs(np.fft.rfft(ts_after.astype(np.float64))) / N + 1e-20)
+    db_b = _windowed_fft_db(ts_before)
+    db_a = _windowed_fft_db(ts_after)
 
     # ── Separate panels ──
     fig, axes = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
@@ -107,7 +125,9 @@ def plot_fft_before_after(
                 ax.axvline(fh, color="orange", alpha=0.2, lw=0.5)
         ax.set_xlim([0, xlim])
     axes[1].set_xlabel("Hz")
-    fig.suptitle(f"FFT before/after — {ch_name}", fontsize=13, fontweight="bold")
+    fig.suptitle(
+        f"FFT before/after (same analysis band, Hann-windowed) — {ch_name}",
+        fontsize=13, fontweight="bold")
     fig.tight_layout()
     savefig(fig, fig_dir, f"{ch_name}_fft_before_after")
 
@@ -116,7 +136,7 @@ def plot_fft_before_after(
     ax.plot(freqs, db_b, color="#d62728", lw=0.3, alpha=0.5, label="Before")
     ax.plot(freqs, db_a, color="#2ca02c", lw=0.3, alpha=0.8, label="After FARM")
     ax.set_xlabel("Hz"); ax.set_ylabel("dB")
-    ax.set_title(f"FFT overlay — {ch_name}"); ax.legend()
+    ax.set_title(f"FFT overlay (same analysis band, Hann-windowed) — {ch_name}"); ax.legend()
     ax.set_xlim([0, xlim])
     fig.tight_layout()
     savefig(fig, fig_dir, f"{ch_name}_fft_overlay")
@@ -139,7 +159,7 @@ def plot_psd_welch_before_after(
     ax.semilogy(f_w, p_b, alpha=0.6, label="Before")
     ax.semilogy(f_w, p_a, alpha=0.8, label="After FARM")
     ax.set_xlabel("Hz"); ax.set_ylabel("PSD")
-    ax.set_title(f"PSD Welch before/after — {ch_name}"); ax.legend()
+    ax.set_title(f"PSD Welch before/after (same analysis band) — {ch_name}"); ax.legend()
     ax.set_xlim([0, xlim])
     fig.tight_layout()
     savefig(fig, fig_dir, f"{ch_name}_psd_welch_before_after")
@@ -156,7 +176,7 @@ def plot_spectrogram_comparison(
     """Side-by-side spectrograms before/after."""
     fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
     for ax, label, ts in zip(
-        axes, ["Before (HPF only)", "After FARM"],
+        axes, ["Before (same analysis band)", "After FARM"],
         [data_before, data_after],
     ):
         nperseg_s = min(512, int(srate * 0.25))

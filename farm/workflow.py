@@ -23,7 +23,7 @@ from farm.io.loader import load_brainvision, select_channels
 from farm.io.triggers import detect_volume_onsets
 
 # ── Preprocessing ────────────────────────────────────────────
-from farm.preprocessing.filters import hpf_fir, lpf_butter, apply_bandpass
+from farm.preprocessing.filters import hpf_fir, apply_bandpass
 from farm.preprocessing.resampling import upsample, downsample
 from farm.preprocessing.trim import trim_to_scan
 
@@ -45,7 +45,10 @@ from farm.pca.cleanup import pca_cleanup
 
 # ── Diagnostics ──────────────────────────────────────────────
 from farm.diagnostics.segments import diagnose_segments
-from farm.diagnostics.metrics import compute_rms_reduction
+from farm.diagnostics.metrics import (
+    compute_rms_reduction,
+    compute_scanner_locked_reduction,
+)
 
 # ── Export ───────────────────────────────────────────────────
 from farm.export.brainvision import export_brainvision
@@ -56,12 +59,51 @@ from farm.export.regressors import build_and_export_regressors
 logger = logging.getLogger("farm.workflow")
 
 
+def _scanner_locked_reference_score(
+    signal_1d: np.ndarray,
+    vol_onsets: np.ndarray,
+    tr_samples: int,
+) -> float:
+    """Ratio of trigger-locked mean energy to non-locked residual energy."""
+    segments = []
+    n = len(signal_1d)
+    for onset in np.asarray(vol_onsets, dtype=np.int64):
+        start = int(onset)
+        stop = start + int(tr_samples)
+        if 0 <= start and stop <= n:
+            segments.append(signal_1d[start:stop])
+    if len(segments) < 3:
+        return 0.0
+    X = np.asarray(segments, dtype=np.float64)
+    template = np.median(X, axis=0)
+    residual = X - template[None, :]
+    locked_rms = float(np.sqrt(np.mean(template * template)))
+    residual_rms = float(np.median(np.sqrt(np.mean(residual * residual, axis=1))))
+    return locked_rms / (residual_rms + 1e-30)
+
+
+def _select_reference_channel(
+    timing_data: np.ndarray,
+    vol_onsets: np.ndarray,
+    srate: float,
+    tr: float,
+) -> tuple[int, np.ndarray]:
+    """Select the channel with the most repeatable trigger-locked artifact."""
+    tr_samples = max(8, int(round(float(tr) * float(srate))))
+    scores = np.asarray([
+        _scanner_locked_reference_score(ch, vol_onsets, tr_samples)
+        for ch in np.asarray(timing_data)
+    ], dtype=np.float64)
+    return int(np.argmax(scores)), scores
+
+
 # ═══════════════════════════════════════════════════════════════
 # Private: per-channel FARM correction
 # ═══════════════════════════════════════════════════════════════
 
 def _correct_channel(
-    ch_signal: np.ndarray,
+    ch_science_signal: np.ndarray,
+    ch_artifact_signal: np.ndarray,
     onsets_up: np.ndarray,
     round_errors: np.ndarray,
     seg_len: int,
@@ -91,7 +133,8 @@ def _correct_channel(
 
     and valid EMG data could be removed during PCA cleanup.
     """
-    signal = np.asarray(ch_signal, dtype=np.float32).copy()
+    signal = np.asarray(ch_science_signal, dtype=np.float32).copy()
+    artifact_reference = np.asarray(ch_artifact_signal, dtype=np.float32).copy()
 
     # ── (iii) Fractional phase alignment ─────────────────────
     aligned_segs, valid_idx = extract_aligned_segments(
@@ -109,7 +152,24 @@ def _correct_channel(
         )
         return signal
 
-    # Replace valid slice segments by their phase-aligned equivalents.
+    artifact_aligned, artifact_valid_idx = extract_aligned_segments(
+        signal_1d=artifact_reference,
+        onsets=onsets_up,
+        seg_len=seg_len,
+        round_errors=round_errors,
+        padding=cfg.padding,
+        indices=valid_idx,
+    )
+
+    if not np.array_equal(valid_idx, artifact_valid_idx):
+        common = np.intersect1d(valid_idx, artifact_valid_idx)
+        science_rows = {int(v): i for i, v in enumerate(valid_idx)}
+        artifact_rows = {int(v): i for i, v in enumerate(artifact_valid_idx)}
+        aligned_segs = aligned_segs[[science_rows[int(v)] for v in common]]
+        artifact_aligned = artifact_aligned[[artifact_rows[int(v)] for v in common]]
+        valid_idx = common.astype(np.int64)
+
+    # Replace science slice segments by their phase-aligned equivalents.
     signal = overwrite_segments(
         signal_1d=signal,
         onsets=onsets_up,
@@ -129,12 +189,15 @@ def _correct_channel(
 
     # ── (v) Adaptive artifact-template construction ──────────
     artifact_segs = build_artifact_templates(
-        aligned_segments=aligned_segs,
+        aligned_segments=artifact_aligned,
         valid_idx=valid_idx,
         slice_info=slice_info,
         n_candidates=cfg.n_candidates,
         dtime_samp_up=dtime_samp_up,
         seg_len=seg_len,
+        trim_fraction=cfg.template_trim_fraction,
+        min_correlation=cfg.template_min_correlation,
+        scale_bounds=cfg.template_scale_bounds,
     )
 
     # Important: artifact estimate is zero everywhere by default.
@@ -189,7 +252,7 @@ def _correct_channel(
             onsets_up,
             seg_len,
             ch_name,
-            "After (iv) zero-fill",
+            f"After (iv) gap mask ({cfg.zero_fill_gap_fraction:.2f})",
             fig_dir,
         )
 
@@ -206,6 +269,12 @@ def _correct_channel(
         dtime_samp_up=dtime_samp_up,
         time_section=cfg.time_section,
         var_threshold=cfg.var_threshold,
+        n_sg=cfg.n_sg,
+        artifact_corr_threshold=cfg.pca_artifact_corr_threshold,
+        mean_corr_threshold=cfg.pca_mean_corr_threshold,
+        mean_repeatability_threshold=cfg.pca_mean_repeatability_threshold,
+        max_components=cfg.pca_max_components,
+        groupwise=cfg.pca_groupwise,
     )
 
     if fig_dir is not None:
@@ -358,46 +427,62 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     ])
 
     # ────────────────────────────────────────────────────────
-    # 5. High-pass filter
+    # 5. Separate science and artifact-estimation branches
     # ────────────────────────────────────────────────────────
-    banner(f"HPF {cfg.hpf_cutoff:g} Hz", "🔊")
+    banner("SCIENCE / ARTIFACT BRANCHES", "🔊")
 
     t0 = time.time()
 
-    data_before_hpf = data.copy()
-    data = hpf_fir(data, srate, cfg.hpf_cutoff)
-    data_hpf = data.copy()
+    # Keep an untouched science branch, but derive scanner timing/templates
+    # from the same 30-Hz HPF branch used by the proven legacy implementation.
+    # The final EMG band is imposed only once, after FARM correction.
+    data_science = data.copy()
+    data_artifact = hpf_fir(data_science, srate, cfg.artifact_hpf_cutoff)
+    if np.isclose(cfg.timing_hpf_cutoff, cfg.artifact_hpf_cutoff):
+        data_timing = data_artifact
+    else:
+        data_timing = hpf_fir(data_science, srate, cfg.timing_hpf_cutoff)
+    data_hpf = data_artifact.copy()
 
-    logger.info("HPF done in %.2f s", time.time() - t0)
+    logger.info(
+        "Branches prepared in %.2f s (artifact HPF %.1f Hz, timing HPF %.1f Hz)",
+        time.time() - t0, cfg.artifact_hpf_cutoff, cfg.timing_hpf_cutoff,
+    )
 
     if fig_dir is not None:
         from farm.visualization.spectra import plot_psd_comparison
 
         plot_psd_comparison(
-            data_before_hpf[0],
-            data[0],
+            data_science[0],
+            data_artifact[0],
             srate,
             ch_names[0],
             fig_dir,
-            "Before HPF",
-            f"After HPF {cfg.hpf_cutoff:g} Hz",
+            "Science branch (unfiltered)",
+            f"Artifact branch HPF {cfg.artifact_hpf_cutoff:g} Hz",
         )
 
-    del data_before_hpf
-
     # ────────────────────────────────────────────────────────
-    # 6. Select reference channel
+    # 6. Select reference channel by scanner-locked repeatability
     # ────────────────────────────────────────────────────────
     banner("REFERENCE CHANNEL", "📡")
 
-    peak_abs = np.max(np.abs(data), axis=1)
+    # Restore the reference criterion that produced the stable timing on the
+    # validation run: largest artifact excursion on the HPF branch.  The
+    # repeatability score is still logged as a diagnostic, but it no longer
+    # chooses a different timing minimum by itself.
+    peak_abs = np.max(np.abs(data_timing), axis=1)
     ref_ch = int(np.argmax(peak_abs))
-
+    _, ref_scores = _select_reference_channel(
+        timing_data=data_timing,
+        vol_onsets=vol_onsets,
+        srate=srate,
+        tr=cfg.tr,
+    )
     logger.info(
-        "Reference channel: %s (selected channel index %d; peak %.3e)",
-        ch_names[ref_ch],
-        ref_ch,
-        peak_abs[ref_ch],
+        "Reference channel: %s (index %d; peak %.3e; locked scores=%s)",
+        ch_names[ref_ch], ref_ch, peak_abs[ref_ch],
+        np.array2string(ref_scores, precision=3),
     )
 
     # ────────────────────────────────────────────────────────
@@ -406,7 +491,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("INITIAL TIMING", "⏱️")
 
     sdur_init, dtime_init, timing_diag = estimate_initial_timing(
-        ref_signal=data[ref_ch],
+        ref_signal=data_timing[ref_ch],
         srate=srate,
         vol_onsets=vol_onsets,
         n_sg=cfg.n_sg,
@@ -426,27 +511,41 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     ])
 
     # ────────────────────────────────────────────────────────
-    # 8. Upsample
+    # 8. Upsample science + artifact branches
     # ────────────────────────────────────────────────────────
     banner(f"UPSAMPLE ×{cfg.interp_factor}", "📈")
 
     t0 = time.time()
 
-    data_up, srate_up, vol_onsets_up = upsample(
-        data=data,
+    data_science_up, srate_up, vol_onsets_up = upsample(
+        data=data_science,
         srate=srate,
         vol_onsets=vol_onsets,
         factor=cfg.interp_factor,
     )
+    data_artifact_up, srate_artifact_up, vol_onsets_artifact_up = upsample(
+        data=data_artifact,
+        srate=srate,
+        vol_onsets=vol_onsets,
+        factor=cfg.interp_factor,
+    )
+    if not (
+        np.isclose(srate_up, srate_artifact_up)
+        and np.array_equal(vol_onsets_up, vol_onsets_artifact_up)
+    ):
+        raise RuntimeError("Upsampled branches are not temporally aligned")
+
+    timing_ref_up = data_artifact_up[ref_ch]
 
     logger.info(
-        "Upsample done in %.2f s — shape %s @ %.3f Hz",
+        "Upsample done in %.2f s — science %s, artifact %s @ %.3f Hz",
         time.time() - t0,
-        data_up.shape,
+        data_science_up.shape,
+        data_artifact_up.shape,
         srate_up,
     )
 
-    del data
+    del data, data_science, data_artifact, data_timing
 
     # ────────────────────────────────────────────────────────
     # 9. Global timing optimisation
@@ -454,7 +553,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("GLOBAL TIMING OPTIMISATION", "🔬")
 
     sdur, dtime, opt_result = optimize_global_timing(
-        ref_signal_up=data_up[ref_ch],
+        ref_signal_up=timing_ref_up,
         srate_up=srate_up,
         vol_onsets_up=vol_onsets_up,
         sdur_init=sdur_init,
@@ -530,15 +629,16 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     # generally zero. Using whole crop boundaries prevents final volume
     # samples from being silently excluded from PCA residual subtraction.
     scan_start_up = 0
-    scan_stop_up = data_up.shape[1]
+    scan_stop_up = data_science_up.shape[1]
 
     for ch in range(n_ch):
         banner(f"CHANNEL {ch + 1}/{n_ch}: {ch_names[ch]}", "🔧")
 
         t0 = time.time()
 
-        data_up[ch] = _correct_channel(
-            ch_signal=data_up[ch],
+        data_science_up[ch] = _correct_channel(
+            ch_science_signal=data_science_up[ch],
+            ch_artifact_signal=data_artifact_up[ch],
             onsets_up=onsets_up,
             round_errors=round_errors,
             seg_len=seg_len,
@@ -559,42 +659,41 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         )
 
     # ────────────────────────────────────────────────────────
-    # 12. Low-pass before downsampling
+    # 12. Downsample core FARM output, then impose EMG band ONCE
     # ────────────────────────────────────────────────────────
     banner("POST-PROCESSING", "📉")
 
     t0 = time.time()
 
-    # Explicit low-pass filtering happens BEFORE downsampling.
-    # This avoids residual high-frequency artifact being folded into lower
-    # frequencies during the decimation step.
-    data_up = lpf_butter(data_up, srate_up, cfg.lpf_cutoff)
-
-    data_clean_crop = downsample(
-        data_up=data_up,
+    # resample_poly performs the anti-alias filtering needed for decimation.
+    # No explicit 250-Hz LPF is applied before downsampling.
+    data_clean_broadband_crop = downsample(
+        data_up=data_science_up,
         srate_up=srate_up,
         factor=cfg.interp_factor,
         target_length=n_samples_orig,
     )
+    del data_science_up, data_artifact_up
 
-    del data_up
-
-    # Optional final LPF at original sampling frequency to remove tiny
-    # resampling-edge residuals. It is normally harmless because data were
-    # already low-passed at the upsampled rate.
-    data_clean_crop = lpf_butter(
-        data_clean_crop,
-        srate,
-        cfg.lpf_cutoff,
+    # The physiologically interpretable output for this acquisition is the
+    # configured EMG band.  Apply it exactly once at native sampling rate.
+    data_before_emg_band = apply_bandpass(data_raw_trim, srate, cfg.bandpass)
+    data_clean_emg_band = apply_bandpass(
+        data_clean_broadband_crop, srate, cfg.bandpass
     )
+    data_clean_crop = data_clean_emg_band
 
-    # Reconstruct the full-length EMG recording:
-    # - outside the fMRI scan crop: untouched raw data;
-    # - inside the crop: FARM-cleaned signal.
+    # Primary BrainVision output: untouched signal outside the scan and the
+    # final EMG-band FARM result inside the scan.  The broadband core remains
+    # available in NPZ/MAT for diagnostics.
     data_clean_full = data_full_raw.copy()
-    data_clean_full[:, s_trim:e_trim] = data_clean_crop
+    data_clean_full[:, s_trim:e_trim] = data_clean_emg_band
 
-    logger.info("Post-processing done in %.2f s", time.time() - t0)
+    logger.info(
+        "Post-processing done in %.2f s — FARM core retained separately; "
+        "final EMG output filtered once at %.1f–%.1f Hz",
+        time.time() - t0, cfg.bandpass[0], cfg.bandpass[1],
+    )
 
     # ────────────────────────────────────────────────────────
     # 13. Final diagnostics
@@ -602,11 +701,20 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("FINAL DIAGNOSTICS", "📊")
 
     rms_results = compute_rms_reduction(
-        data_before=data_hpf,
-        data_after=data_clean_crop,
+        data_before=data_before_emg_band,
+        data_after=data_clean_emg_band,
         srate=srate,
         ch_names=ch_names,
-        bandpass=cfg.bandpass,
+        bandpass=None,
+    )
+    scanner_locked_results = compute_scanner_locked_reduction(
+        data_before=data_before_emg_band,
+        data_after=data_clean_emg_band,
+        srate=srate,
+        ch_names=ch_names,
+        vol_onsets=vol_onsets,
+        tr=cfg.tr,
+        bandpass=None,
     )
 
     if fig_dir is not None:
@@ -625,28 +733,18 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         for ch_i in range(n_ch):
             name = ch_names[ch_i]
 
+            # Main spectral QC uses exactly the same 30–250 Hz analysis band
+            # on before/after signals.  Broadband core data are still exported.
             plot_fft_power(
-                data_clean_crop[ch_i],
+                data_clean_emg_band[ch_i],
                 srate,
                 name,
                 fig_dir,
             )
 
-            ts_before = apply_bandpass(
-                data_hpf[ch_i],
-                srate,
-                cfg.bandpass,
-            )
-
-            ts_after = apply_bandpass(
-                data_clean_crop[ch_i],
-                srate,
-                cfg.bandpass,
-            )
-
             plot_fft_before_after(
-                ts_before,
-                ts_after,
+                data_before_emg_band[ch_i],
+                data_clean_emg_band[ch_i],
                 srate,
                 name,
                 fig_dir,
@@ -654,33 +752,33 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             )
 
             plot_psd_welch_before_after(
-                ts_before,
-                ts_after,
+                data_before_emg_band[ch_i],
+                data_clean_emg_band[ch_i],
                 srate,
                 name,
                 fig_dir,
             )
 
             plot_spectrogram_comparison(
-                data_hpf[ch_i],
-                data_clean_crop[ch_i],
+                data_before_emg_band[ch_i],
+                data_clean_emg_band[ch_i],
                 srate,
                 name,
                 fig_dir,
             )
 
             plot_session_comparison(
-                data_hpf[ch_i],
-                data_clean_crop[ch_i],
+                data_before_emg_band[ch_i],
+                data_clean_emg_band[ch_i],
                 srate,
                 name,
                 fig_dir,
-                cfg.bandpass,
+                bandpass=None,
             )
 
             plot_carpet_comparison(
-                data_before=data_hpf[ch_i],
-                data_after=data_clean_crop[ch_i],
+                data_before=data_before_emg_band[ch_i],
+                data_after=data_clean_emg_band[ch_i],
                 srate=srate,
                 ch_name=name,
                 vol_onsets=vol_onsets,
@@ -688,7 +786,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
                 n_sg=cfg.n_sg,
                 n_vol=n_vol,
                 fig_dir=fig_dir,
-                bandpass=cfg.bandpass,
+                bandpass=None,
             )
 
             plot_full_signal_overview(
@@ -718,8 +816,10 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         cfg.output_dir,
         basename,
         clean_full=data_clean_full,
+        clean_broadband_crop=data_clean_broadband_crop,
+        clean_emg_band=data_clean_emg_band,
         raw_trim=data_raw_trim,
-        pca_clean=data_clean_crop,
+        pca_clean=data_clean_emg_band,
         hpf_data=data_hpf,
         ch_names=np.array(ch_names),
         srate=srate,
@@ -741,8 +841,10 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         cfg.output_dir,
         basename,
         clean_full=data_clean_full,
+        clean_broadband_crop=data_clean_broadband_crop,
+        clean_emg_band=data_clean_emg_band,
         raw_trim=data_raw_trim,
-        pca_clean=data_clean_crop,
+        pca_clean=data_clean_emg_band,
         hpf_data=data_hpf,
         ch_names=np.array(ch_names, dtype=object),
         srate=srate,
@@ -768,13 +870,13 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     banner("EMG REGRESSORS", "📉")
 
     all_regressors = build_and_export_regressors(
-        data_clean_crop=data_clean_crop,
+        data_clean_crop=data_clean_emg_band,
         srate=srate,
         ch_names=ch_names,
         n_vol=n_vol,
         tr=cfg.tr,
         volume_onsets_sec=volume_onsets_sec,
-        bandpass=cfg.bandpass,
+        bandpass=None,
         output_dir=cfg.output_dir,
         basename=basename,
         fig_dir=fig_dir,
@@ -808,7 +910,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     return {
         "data_clean_full": data_clean_full,
-        "data_clean_crop": data_clean_crop,
+        "data_clean_crop": data_clean_emg_band,
+        "data_clean_broadband_crop": data_clean_broadband_crop,
+        "data_clean_emg_band": data_clean_emg_band,
         "data_hpf": data_hpf,
         "data_raw_trim": data_raw_trim,
         "data_full_raw": data_full_raw,
@@ -827,6 +931,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "n_sg": cfg.n_sg,
         "raw_original": raw_original,
         "rms_results": rms_results,
+        "scanner_locked_results": scanner_locked_results,
         "regressors": all_regressors,
         "figures_dir": fig_dir,
         "output_dir": cfg.output_dir,

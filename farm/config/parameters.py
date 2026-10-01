@@ -34,14 +34,36 @@ class FARMConfig:
     time_section: float = 60.0
     var_threshold: float = 5.0
 
+    # Core EMG branch.  Timing and template estimation use the same HPF
+    # branch as the proven legacy pipeline; this avoids selecting a different
+    # timing minimum merely because of a separate reference filter.
+    artifact_hpf_cutoff: float = 30.0
+    timing_hpf_cutoff: float = 30.0
+
+    # Global section-wise PCA.  The experimental group-wise PCA produced
+    # hundreds of independent fits and slice-periodic spectral structure.
+    pca_artifact_corr_threshold: float = 0.10
+    pca_mean_corr_threshold: float = 0.10
+    pca_mean_repeatability_threshold: float = 0.20
+    pca_max_components: int = 6
+    pca_groupwise: bool = False
+
+    # Template defaults intentionally reproduce legacy FARM behaviour while
+    # retaining the corrected full window for the last acquisition group.
+    template_trim_fraction: float = 0.0
+    template_min_correlation: float = -1.0
+    template_scale_bounds: Optional[Tuple[float, float]] = None
+
     bandpass: Tuple[float, float] = (30.0, 250.0)
-    hpf_cutoff: float = 30.0
+    hpf_cutoff: float = 30.0  # retained for backward compatibility / QC
+    # Legacy compatibility only: the core cleaned waveform is no longer
+    # post-filtered at this cutoff. Use ``bandpass`` for the derived EMG band.
     lpf_cutoff: float = 250.0
     padding: int = 10
 
-    # Fraction of the actual inter-volume gap to suppress around
-    # the volume boundary. 0.0 means no masking; 1.0 masks all gap.
-    zero_fill_gap_fraction: float = 1.0
+    # Preserve the inter-volume dead-time by default.  Set >0 only when a
+    # dataset has demonstrated boundary contamination that must be masked.
+    zero_fill_gap_fraction: float = 0.0
 
     # ── Envelope baseline correction ─────────────────────────
     envelope_baseline: str = "robust"
@@ -117,6 +139,25 @@ class FARMConfig:
         if not (0.0 < self.var_threshold <= 100.0):
             raise ValueError("var_threshold must be in ]0, 100]")
 
+        if not (0.0 <= self.pca_artifact_corr_threshold <= 1.0):
+            raise ValueError("pca_artifact_corr_threshold must be in [0, 1]")
+        if not (0.0 <= self.pca_mean_corr_threshold <= 1.0):
+            raise ValueError("pca_mean_corr_threshold must be in [0, 1]")
+        if self.pca_mean_repeatability_threshold < 0.0:
+            raise ValueError("pca_mean_repeatability_threshold must be >= 0")
+        if self.pca_max_components < 0:
+            raise ValueError("pca_max_components must be >= 0")
+
+        if not (0.0 <= self.template_trim_fraction < 0.5):
+            raise ValueError("template_trim_fraction must be in [0, 0.5)")
+        if not (-1.0 <= self.template_min_correlation <= 1.0):
+            raise ValueError("template_min_correlation must be in [-1, 1]")
+        if self.template_scale_bounds is not None:
+            if len(self.template_scale_bounds) != 2 or not (
+                self.template_scale_bounds[0] < self.template_scale_bounds[1]
+            ):
+                raise ValueError("template_scale_bounds must be None or (min, max)")
+
         if self.padding < 0:
             raise ValueError("padding must be >= 0")
 
@@ -149,6 +190,8 @@ class FARMConfig:
 
         checks = {
             "hpf_cutoff": self.hpf_cutoff,
+            "artifact_hpf_cutoff": self.artifact_hpf_cutoff,
+            "timing_hpf_cutoff": self.timing_hpf_cutoff,
             "lpf_cutoff": self.lpf_cutoff,
             "bandpass low": self.bandpass[0],
             "bandpass high": self.bandpass[1],

@@ -39,6 +39,26 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--var-threshold", type=float, default=5.0)
     p.add_argument("--artifact-hpf", type=float, default=30.0)
     p.add_argument("--timing-hpf", type=float, default=30.0)
+    p.add_argument(
+        "--timing-mode", choices=("initial", "local", "fixed"), default="initial",
+        help=(
+            "Timing policy. 'initial' (default) uses robust per-volume/channel "
+            "timing; 'local' permits only a tightly bounded high-frequency "
+            "refinement; 'fixed' uses --fixed-sdur-ms for all runs."
+        ),
+    )
+    p.add_argument(
+        "--timing-refine-half-width-ms", type=float, default=0.5,
+        help="Half-width of LOCAL timing refinement around the robust estimate (ms)",
+    )
+    p.add_argument(
+        "--timing-min-relative-improvement", type=float, default=0.005,
+        help="Minimum relative cost improvement required to accept LOCAL refinement",
+    )
+    p.add_argument(
+        "--fixed-sdur-ms", type=float, default=None,
+        help="Fixed slice-group duration in ms when --timing-mode fixed",
+    )
     p.add_argument("--template-min-corr", type=float, default=-1.0)
     p.add_argument("--template-trim", type=float, default=0.0)
     p.add_argument("--pca-artifact-corr", type=float, default=0.10)
@@ -70,6 +90,10 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         var_threshold=args.var_threshold,
         artifact_hpf_cutoff=args.artifact_hpf,
         timing_hpf_cutoff=args.timing_hpf,
+        timing_mode=args.timing_mode,
+        timing_refine_half_width_seconds=args.timing_refine_half_width_ms / 1000.0,
+        timing_min_relative_improvement=args.timing_min_relative_improvement,
+        fixed_sdur_seconds=(None if args.fixed_sdur_ms is None else args.fixed_sdur_ms / 1000.0),
         template_min_correlation=args.template_min_corr,
         template_trim_fraction=args.template_trim,
         pca_artifact_corr_threshold=args.pca_artifact_corr,

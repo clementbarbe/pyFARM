@@ -65,6 +65,39 @@ denoised/
 Figures are written under `figures/<run_basename>/` so batch runs cannot
 overwrite one another.
 
+## Timing stability (v1.1)
+
+`sdur` is a property of the EPI acquisition sequence. It must not jump by
+tens of milliseconds merely because the subject or EMG run changed. Earlier
+versions allowed a broad numerical timing search; because the FARM alignment
+objective is periodic, that search could converge to harmonic/sub-harmonic
+minima while still reporting `success=True`.
+
+The default is now:
+
+```text
+--timing-mode initial
+```
+
+Timing is estimated independently on every selected EMG channel, robustly
+combined across channels, and `dtime` is derived from the measured TR. No
+broad global optimisation is performed.
+
+Three modes are available:
+
+- `initial` (recommended/default): robust run estimate; safest for fixed EPI protocols.
+- `local`: optional high-frequency refinement restricted to +/-0.5 ms by default.
+- `fixed`: use exactly the same protocol timing for every run. Example:
+
+```bash
+pyfarm-denoise batch raw denoised ... \
+  --timing-mode fixed --fixed-sdur-ms 81.9955
+```
+
+Use `fixed` only after establishing the protocol timing from representative
+runs or sequence documentation. The sidecar records both the initial and final
+timing so cohort-level QC is straightforward.
+
 ## Important protocol-specific setting
 
 `zero_fill_gap_fraction=0` is the generic safety default because masking a gap

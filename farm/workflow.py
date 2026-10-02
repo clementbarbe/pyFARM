@@ -11,6 +11,7 @@ All diagnostic figures are saved as ``.png`` files to the configured
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -488,20 +489,52 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     # ────────────────────────────────────────────────────────
     banner("INITIAL TIMING", "⏱️")
 
-    sdur_init, dtime_init, timing_diag = estimate_initial_timing(
-        ref_signal=data_timing[ref_ch],
-        srate=srate,
-        vol_onsets=vol_onsets,
-        n_sg=cfg.n_sg,
-        n_vol=n_vol,
-    )
+    # Estimate timing independently on every selected EMG channel, then use a
+    # robust channel consensus. Sequence timing is a scanner property, not an
+    # electrode property; a single noisy/muscular channel must not redefine it.
+    initial_sdur_by_channel = []
+    initial_dtime_by_channel = []
+    timing_diags = []
+    for ch_i, name in enumerate(ch_names):
+        s_i, d_i, diag_i = estimate_initial_timing(
+            ref_signal=data_timing[ch_i],
+            srate=srate,
+            vol_onsets=vol_onsets,
+            n_sg=cfg.n_sg,
+            n_vol=n_vol,
+        )
+        initial_sdur_by_channel.append(float(s_i))
+        initial_dtime_by_channel.append(float(d_i))
+        timing_diags.append(diag_i)
+        logger.info(
+            "Timing candidate %s: sdur=%.6f ms dtime=%.6f ms",
+            name, s_i * 1e3, d_i * 1e3,
+        )
 
-    del timing_diag
+    initial_sdur_by_channel = np.asarray(initial_sdur_by_channel, dtype=np.float64)
+    initial_dtime_by_channel = np.asarray(initial_dtime_by_channel, dtype=np.float64)
+    sdur_init = float(np.median(initial_sdur_by_channel))
+
+    observed_tr_pre = float(np.median(np.diff(vol_onsets))) / srate
+    dtime_init = max(0.0, observed_tr_pre - cfg.n_sg * sdur_init)
+    channel_spread = float(np.max(initial_sdur_by_channel) - np.min(initial_sdur_by_channel))
+    if channel_spread > 0.0005:
+        logger.warning(
+            "Timing candidates disagree by %.3f ms across channels; inspect timing QC",
+            channel_spread * 1e3,
+        )
+
+    # High-frequency scanner-dominated reference used only by optional LOCAL
+    # refinement. This is the same 250-Hz-HPF signal used by the stable coarse
+    # estimator, not the 30-Hz artifact/template branch.
+    timing_ref_hf = np.asarray(timing_diags[ref_ch]["ref_250"], dtype=np.float32)
 
     info_table([
         ("Acquisition groups / volume", f"{cfg.n_sg}"),
-        ("sdur_init", f"{sdur_init * 1e3:.4f} ms"),
-        ("dtime_init", f"{dtime_init * 1e3:.4f} ms"),
+        ("Timing mode", cfg.timing_mode),
+        ("sdur_init consensus", f"{sdur_init * 1e3:.4f} ms"),
+        ("dtime_init derived", f"{dtime_init * 1e3:.4f} ms"),
+        ("Channel sdur spread", f"{channel_spread * 1e3:.4f} ms"),
         (
             "TR reconstr.",
             f"{(cfg.n_sg * sdur_init + dtime_init) * 1e3:.4f} ms",
@@ -533,7 +566,20 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     ):
         raise RuntimeError("Upsampled branches are not temporally aligned")
 
-    timing_ref_up = data_artifact_up[ref_ch]
+    timing_ref_up = None
+    if cfg.timing_mode == "local":
+        timing_ref_up_2d, srate_timing_up, vol_onsets_timing_up = upsample(
+            data=timing_ref_hf[None, :],
+            srate=srate,
+            vol_onsets=vol_onsets,
+            factor=cfg.interp_factor,
+        )
+        if not (
+            np.isclose(srate_up, srate_timing_up)
+            and np.array_equal(vol_onsets_up, vol_onsets_timing_up)
+        ):
+            raise RuntimeError("Upsampled timing reference is not aligned")
+        timing_ref_up = timing_ref_up_2d[0]
 
     logger.info(
         "Upsample done in %.2f s — science %s, artifact %s @ %.3f Hz",
@@ -543,35 +589,71 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         srate_up,
     )
 
-    del data, data_science, data_artifact, data_timing
+    del data, data_science, data_artifact, data_timing, timing_ref_hf, timing_diags
 
     # ────────────────────────────────────────────────────────
-    # 9. Global timing optimisation
+    # 9. Protocol-safe timing decision
     # ────────────────────────────────────────────────────────
-    banner("GLOBAL TIMING OPTIMISATION", "🔬")
-
-    sdur, dtime, opt_result = optimize_global_timing(
-        ref_signal_up=timing_ref_up,
-        srate_up=srate_up,
-        vol_onsets_up=vol_onsets_up,
-        sdur_init=sdur_init,
-        dtime_init=dtime_init,
-        n_sg=cfg.n_sg,
-        n_vol=n_vol,
-        padding=cfg.padding,
-        window_size=cfg.window_size,
-    )
+    banner("TIMING DECISION", "🔬")
 
     observed_tr = float(np.median(np.diff(vol_onsets))) / srate
+
+    if cfg.timing_mode == "fixed":
+        sdur = float(cfg.fixed_sdur_seconds)
+        if cfg.n_sg * sdur >= observed_tr:
+            raise ValueError(
+                "fixed_sdur_seconds is incompatible with measured TR and n_sg"
+            )
+        dtime = observed_tr - cfg.n_sg * sdur
+        opt_result = SimpleNamespace(
+            fun=float("nan"), success=True, accepted=True,
+            relative_improvement=float("nan"), hits_edge=False,
+        )
+        logger.info(
+            "Fixed protocol timing: sdur=%.6f ms, dtime=%.6f ms",
+            sdur * 1e3, dtime * 1e3,
+        )
+    elif cfg.timing_mode == "local":
+        sdur, dtime, opt_result = optimize_global_timing(
+            ref_signal_up=timing_ref_up,
+            srate_up=srate_up,
+            vol_onsets_up=vol_onsets_up,
+            sdur_init=sdur_init,
+            dtime_init=dtime_init,
+            n_sg=cfg.n_sg,
+            n_vol=n_vol,
+            padding=cfg.padding,
+            window_size=cfg.window_size,
+            refine_half_width_seconds=cfg.timing_refine_half_width_seconds,
+            min_relative_improvement=cfg.timing_min_relative_improvement,
+        )
+    else:
+        # Safe default: the robust per-volume/per-channel estimate is already
+        # sub-sample-stable for a fixed scanner sequence. Do not let a periodic
+        # denoising cost replace it with a distant harmonic minimum.
+        sdur = float(sdur_init)
+        dtime = max(0.0, observed_tr - cfg.n_sg * sdur)
+        opt_result = SimpleNamespace(
+            fun=float("nan"), success=True, accepted=False,
+            relative_improvement=float("nan"), hits_edge=False,
+        )
+        logger.info(
+            "Using robust initial timing without global optimisation: "
+            "sdur=%.6f ms, dtime=%.6f ms",
+            sdur * 1e3, dtime * 1e3,
+        )
+
     reconstructed_tr = cfg.n_sg * sdur + dtime
+    if timing_ref_up is not None:
+        del timing_ref_up
 
     info_table([
+        ("Timing mode", cfg.timing_mode),
         ("sdur", f"{sdur * 1e3:.6f} ms"),
         ("dtime", f"{dtime * 1e3:.6f} ms"),
         ("Observed TR", f"{observed_tr * 1e3:.6f} ms"),
         ("TR reconstruction", f"{reconstructed_tr * 1e3:.6f} ms"),
-        ("Timing cost", f"{opt_result.fun:.6f}"),
-        ("Converged", str(opt_result.success)),
+        ("Local refinement accepted", str(getattr(opt_result, "accepted", False))),
     ])
 
     # ────────────────────────────────────────────────────────
@@ -794,6 +876,11 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "scan_stop_sample_exclusive": e_trim,
         "volume_onsets_samples_full": vol_onsets_abs,
         "volume_onsets_samples_crop": vol_onsets,
+        "timing_mode": cfg.timing_mode,
+        "sdur_initial_seconds": sdur_init,
+        "dtime_initial_seconds": dtime_init,
+        "initial_sdur_by_channel_seconds": initial_sdur_by_channel,
+        "initial_dtime_by_channel_seconds": initial_dtime_by_channel,
         "sdur_seconds": sdur,
         "dtime_seconds": dtime,
         "observed_tr_seconds": observed_tr,

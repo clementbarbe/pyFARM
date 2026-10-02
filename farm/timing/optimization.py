@@ -158,47 +158,48 @@ def optimize_global_timing(
     n_vol: int,
     padding: int = 10,
     window_size: int = 50,
+    refine_half_width_seconds: float = 0.0005,
+    min_relative_improvement: float = 0.005,
 ) -> tuple[float, float, object]:
-    """Refine intra-volume slice duration while preserving real trigger timing.
+    """Locally refine slice-group duration around a robust initial estimate.
 
-    ``sdur`` is optimized as a scalar. ``dtime`` is then derived from the
-    measured inter-trigger interval:
+    The EPI sequence timing is a scanner/protocol property. A denoising
+    objective is highly periodic and therefore contains harmonic and
+    sub-harmonic minima. A broad optimiser can converge perfectly to a
+    numerically valid but physically wrong timing.
 
-        dtime = median(TR_observed) - n_sg * sdur
-
-    This avoids the old behavior where small timing errors accumulated over
-    many volumes because only the first trigger was used as an anchor.
+    This routine therefore *only* performs a small local refinement around
+    ``sdur_init``. If the optimum hits the search boundary or does not
+    improve the objective by ``min_relative_improvement``, the initial timing
+    is retained. ``dtime`` is always derived from the measured TR.
     """
-    del dtime_init  # Initial dtime is not independently optimized anymore.
+    del dtime_init
 
     ref_signal_up = np.asarray(ref_signal_up)
     vol_onsets_up = np.asarray(vol_onsets_up, dtype=np.int64)
 
     if n_vol < 2:
         raise ValueError("Need at least two volumes for timing optimisation")
-
     if len(vol_onsets_up) < n_vol:
         raise ValueError("vol_onsets_up has fewer entries than n_vol")
-
     if n_sg < 2:
         raise ValueError("n_sg must be >= 2")
+    if refine_half_width_seconds <= 0:
+        raise ValueError("refine_half_width_seconds must be > 0")
+    if min_relative_improvement < 0:
+        raise ValueError("min_relative_improvement must be >= 0")
 
     observed_intervals = np.diff(vol_onsets_up[:n_vol]).astype(np.float64)
     tr_samples_median = float(np.median(observed_intervals))
     tr_seconds_median = tr_samples_median / srate_up
-
-    # A small safety margin avoids allowing the acquisition train to spill
-    # into the next trigger interval.
     max_sdur = 0.999 * tr_seconds_median / n_sg
 
-    # Allow a reasonable local search around the initial estimate, while
-    # ensuring a broad enough interval to recover from poor coarse estimates.
-    lower = max(8.0 / srate_up, 0.80 * sdur_init)
-    upper = min(max_sdur, 1.20 * sdur_init)
-
+    lower = max(8.0 / srate_up, sdur_init - refine_half_width_seconds)
+    upper = min(max_sdur, sdur_init + refine_half_width_seconds)
     if lower >= upper:
-        lower = max(8.0 / srate_up, 0.50 * max_sdur)
-        upper = max_sdur
+        raise ValueError(
+            "No valid local timing interval around sdur_init; check TR/n_sg"
+        )
 
     slice_meta = build_slice_info(
         n_total=n_vol * n_sg,
@@ -206,36 +207,56 @@ def optimize_global_timing(
         window_size=window_size,
     )
 
+    args = (
+        ref_signal_up, vol_onsets_up, n_sg, n_vol, slice_meta, srate_up, padding
+    )
+    cost_init = _global_cost_sdur(sdur_init, *args)
+
     result = minimize_scalar(
         _global_cost_sdur,
         bounds=(lower, upper),
         method="bounded",
-        args=(
-            ref_signal_up,
-            vol_onsets_up,
-            n_sg,
-            n_vol,
-            slice_meta,
-            srate_up,
-            padding,
-        ),
-        options={
-            "xatol": 1e-10,
-            "maxiter": 300,
-        },
+        args=args,
+        options={"xatol": 1e-9, "maxiter": 120},
     )
 
-    sdur = float(result.x)
+    candidate = float(result.x)
+    cost_candidate = float(result.fun)
+    relative_improvement = (cost_init - cost_candidate) / (abs(cost_init) + 1e-30)
+
+    width = upper - lower
+    edge_tol = max(5.0 / srate_up, 0.02 * width)
+    hits_edge = (candidate - lower <= edge_tol) or (upper - candidate <= edge_tol)
+
+    accepted = (
+        bool(result.success)
+        and np.isfinite(cost_candidate)
+        and not hits_edge
+        and relative_improvement >= min_relative_improvement
+    )
+
+    if accepted:
+        sdur = candidate
+        decision = "accepted local refinement"
+    else:
+        sdur = float(sdur_init)
+        decision = "kept robust initial timing"
+
     dtime = max(0.0, tr_seconds_median - n_sg * sdur)
 
+    result.cost_initial = float(cost_init)
+    result.relative_improvement = float(relative_improvement)
+    result.hits_edge = bool(hits_edge)
+    result.accepted = bool(accepted)
+    result.sdur_initial = float(sdur_init)
+    result.search_bounds = (float(lower), float(upper))
+
     logger.info(
-        "Optimised timing: sdur=%.6f ms, dtime=%.6f ms, "
-        "observed TR=%.6f ms, cost=%.6f, success=%s",
-        sdur * 1e3,
-        dtime * 1e3,
-        tr_seconds_median * 1e3,
-        float(result.fun),
-        bool(result.success),
+        "Local timing refinement: init=%.6f ms, candidate=%.6f ms, "
+        "final=%.6f ms, dtime=%.6f ms, rel_improvement=%.3f%%, "
+        "edge=%s — %s",
+        sdur_init * 1e3, candidate * 1e3, sdur * 1e3, dtime * 1e3,
+        100.0 * relative_improvement, hits_edge, decision,
     )
 
     return sdur, dtime, result

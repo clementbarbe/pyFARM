@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfarm-denoise"
+version = "1.1.0"
+description = "Pure FARM-inspired EMG-fMRI gradient artifact denoising"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "mne>=1.5",
+  "matplotlib>=3.7",
+  "pybv>=0.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+pyfarm-denoise = "farm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["farm*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["farm/tests"]

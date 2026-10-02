@@ -86,12 +86,22 @@ def estimate_initial_timing(
         dtime_list.append(best_dt / srate)
         sv_list.append(best_sv)
 
-    sdur_init = float(np.mean(sdur_list))
-    dtime_init = float(np.mean(dtime_list))
+    # Use robust medians rather than means. A few volumes can contain strong
+    # voluntary EMG or transient motion; those volumes must not pull the
+    # sequence timing away from the scanner's fixed acquisition pattern.
+    sdur_arr = np.asarray(sdur_list, dtype=np.float64)
+    dtime_arr = np.asarray(dtime_list, dtype=np.float64)
+    sdur_init = float(np.median(sdur_arr))
+    dtime_init = float(np.median(dtime_arr))
+
+    sdur_mad = float(np.median(np.abs(sdur_arr - sdur_init)))
+    dtime_mad = float(np.median(np.abs(dtime_arr - dtime_init)))
 
     logger.info(
-        "Initial timing: sdur=%.4f ms, dtime=%.4f ms",
+        "Initial timing: sdur=%.4f ms, dtime=%.4f ms "
+        "(volume MAD %.4f / %.4f ms)",
         sdur_init * 1e3, dtime_init * 1e3,
+        sdur_mad * 1e3, dtime_mad * 1e3,
     )
 
     diag = {
@@ -101,5 +111,7 @@ def estimate_initial_timing(
         "dtime_candidates": dtime_candidates,
         "ref_250": ref_250,
         "n_sample_per_tr": n_sample_per_tr,
+        "sdur_mad": sdur_mad,
+        "dtime_mad": dtime_mad,
     }
     return sdur_init, dtime_init, diag

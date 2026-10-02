@@ -40,6 +40,16 @@ class FARMConfig:
     artifact_hpf_cutoff: float = 30.0
     timing_hpf_cutoff: float = 30.0
 
+    # Timing policy. ``initial`` is the safe default for fixed EPI protocols:
+    # it uses the robust per-volume estimate and never lets a later numerical
+    # optimiser jump to a harmonic/sub-harmonic timing minimum. ``local``
+    # enables a tightly bounded high-frequency refinement around that estimate.
+    # ``fixed`` uses ``fixed_sdur_seconds`` and derives dtime from the measured TR.
+    timing_mode: str = "initial"
+    timing_refine_half_width_seconds: float = 0.0005  # +/-0.5 ms
+    timing_min_relative_improvement: float = 0.005
+    fixed_sdur_seconds: Optional[float] = None
+
     # Artifact-specific global PCA
     pca_artifact_corr_threshold: float = 0.10
     pca_mean_corr_threshold: float = 0.10
@@ -110,6 +120,18 @@ class FARMConfig:
             raise ValueError("time_section must be positive")
         if not (0.0 < self.var_threshold <= 100.0):
             raise ValueError("var_threshold must be in ]0, 100]")
+        if self.timing_mode not in {"initial", "local", "fixed"}:
+            raise ValueError("timing_mode must be 'initial', 'local' or 'fixed'")
+        if self.timing_refine_half_width_seconds <= 0:
+            raise ValueError("timing_refine_half_width_seconds must be > 0")
+        if self.timing_min_relative_improvement < 0:
+            raise ValueError("timing_min_relative_improvement must be >= 0")
+        if self.timing_mode == "fixed":
+            if self.fixed_sdur_seconds is None or self.fixed_sdur_seconds <= 0:
+                raise ValueError(
+                    "fixed_sdur_seconds must be provided and > 0 when timing_mode='fixed'"
+                )
+
         if not (0.0 <= self.pca_artifact_corr_threshold <= 1.0):
             raise ValueError("pca_artifact_corr_threshold must be in [0, 1]")
         if not (0.0 <= self.pca_mean_corr_threshold <= 1.0):

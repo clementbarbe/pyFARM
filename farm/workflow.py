@@ -42,6 +42,7 @@ from farm.alignment.phase_shift import (
 )
 from farm.templates.subtraction import build_artifact_templates
 from farm.templates.zerofill import zero_fill_dtime
+from farm.diagnostics.gapmask import gap_mask_native
 from farm.pca.cleanup import pca_cleanup
 
 # ── Diagnostics ──────────────────────────────────────────────
@@ -198,6 +199,8 @@ def _correct_channel(
         trim_fraction=cfg.template_trim_fraction,
         min_correlation=cfg.template_min_correlation,
         scale_bounds=cfg.template_scale_bounds,
+        method=cfg.template_method,
+        huber_delta=cfg.template_huber_delta,
     )
 
     # Important: artifact estimate is zero everywhere by default.
@@ -257,6 +260,12 @@ def _correct_channel(
         )
 
     # ── (vi) PCA residual cleanup ────────────────────────────
+    if cfg.pca_mode == "disabled":
+        clean = signal_zf.copy()
+        clean[scan_start_up:scan_stop_up] -= artifact_zf[scan_start_up:scan_stop_up]
+        return clean.astype(np.float32)
+
+    conservative = cfg.pca_mode == "conservative"
     clean = pca_cleanup(
         vol_clean_signal=signal_zf,
         vol_noise_signal=artifact_zf,
@@ -270,10 +279,14 @@ def _correct_channel(
         time_section=cfg.time_section,
         var_threshold=cfg.var_threshold,
         n_sg=cfg.n_sg,
-        artifact_corr_threshold=cfg.pca_artifact_corr_threshold,
-        mean_corr_threshold=cfg.pca_mean_corr_threshold,
-        mean_repeatability_threshold=cfg.pca_mean_repeatability_threshold,
-        max_components=cfg.pca_max_components,
+        artifact_corr_threshold=(max(cfg.pca_artifact_corr_threshold, 0.4)
+                                 if conservative else cfg.pca_artifact_corr_threshold),
+        mean_corr_threshold=(max(cfg.pca_mean_corr_threshold, 0.5)
+                             if conservative else cfg.pca_mean_corr_threshold),
+        mean_repeatability_threshold=(max(cfg.pca_mean_repeatability_threshold, 0.5)
+                                      if conservative else cfg.pca_mean_repeatability_threshold),
+        max_components=(min(cfg.pca_max_components, 2) if conservative
+                        else cfg.pca_max_components),
         groupwise=cfg.pca_groupwise,
     )
 
@@ -502,6 +515,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             vol_onsets=vol_onsets,
             n_sg=cfg.n_sg,
             n_vol=n_vol,
+            dtime_max_ms=cfg.timing_dtime_max_ms,
+            search_step_samples=cfg.timing_search_step_samples,
         )
         initial_sdur_by_channel.append(float(s_i))
         initial_dtime_by_channel.append(float(d_i))
@@ -856,6 +871,25 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         basename=basename,
     )
 
+    gap_mask_path = None
+    if cfg.export_gap_mask:
+        mask_crop = gap_mask_native(
+            onsets_up=onsets_up,
+            last_slice_idx=slice_info["last_slice_idx"],
+            seg_len_up=seg_len,
+            n_samples_native=n_samples_orig,
+            interp_factor=cfg.interp_factor,
+            gap_fraction=cfg.zero_fill_gap_fraction,
+            guard_samples=cfg.gap_mask_guard_samples,
+        )
+        mask_full = np.zeros(n_samples_full, dtype=bool)
+        mask_full[s_trim:e_trim] = mask_crop
+        mask_path = Path(cfg.output_dir) / f"{basename}_unreliable_mask.npz"
+        np.savez_compressed(mask_path, unreliable=mask_full,
+                            sampling_rate_hz=np.array(srate),
+                            sample_index_base=np.array(0))
+        gap_mask_path = str(mask_path.resolve())
+
     metadata = {
         "format_version": 1,
         "kind": "pyFARM-denoise",
@@ -886,6 +920,11 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "observed_tr_seconds": observed_tr,
         "reconstructed_tr_seconds": reconstructed_tr,
         "zero_fill_gap_fraction": cfg.zero_fill_gap_fraction,
+        "unreliable_mask_path": gap_mask_path,
+        "unreliable_mask_includes_guard_samples": cfg.gap_mask_guard_samples,
+        "unreliable_mask_true_means": "zero-filled gap or resampling guard",
+        "template_method": cfg.template_method,
+        "pca_mode": cfg.pca_mode,
         "qc_bandpass_hz": cfg.qc_bandpass,
         "rms_reduction": rms_results,
         "scanner_locked_reduction": scanner_locked_results,
@@ -940,4 +979,5 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "output_dir": cfg.output_dir,
         "brainvision_path": brainvision_path,
         "metadata_path": metadata_path,
+        "unreliable_mask_path": gap_mask_path,
     }

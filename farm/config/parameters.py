@@ -61,6 +61,13 @@ class FARMConfig:
     # FARM-like top-N arithmetic mean while keeping the corrected last-group
     # correlation window.
     template_trim_fraction: float = 0.0
+    template_method: str = "mean"
+    template_huber_delta: float = 1.5
+    pca_mode: str = "current"
+    export_gap_mask: bool = False
+    gap_mask_guard_samples: int = 16
+    timing_dtime_max_ms: Optional[float] = None
+    timing_search_step_samples: int = 16
     template_min_correlation: float = -1.0
     template_scale_bounds: Optional[Tuple[float, float]] = None
 
@@ -140,6 +147,20 @@ class FARMConfig:
             raise ValueError("pca_mean_repeatability_threshold must be >= 0")
         if self.pca_max_components < 0:
             raise ValueError("pca_max_components must be >= 0")
+        if self.template_method not in {"mean", "trimmed", "median", "huber"}:
+            raise ValueError("Invalid template_method")
+        if self.template_huber_delta <= 0 or not math.isfinite(self.template_huber_delta):
+            raise ValueError("template_huber_delta must be finite and positive")
+        if self.pca_mode not in {"current", "disabled", "conservative"}:
+            raise ValueError("Invalid pca_mode")
+        if self.gap_mask_guard_samples < 0:
+            raise ValueError("gap_mask_guard_samples must be >= 0")
+        if self.timing_dtime_max_ms is not None and not (
+            0 < self.timing_dtime_max_ms < self.tr * 1000
+        ):
+            raise ValueError("timing_dtime_max_ms must lie in (0, TR)")
+        if self.timing_search_step_samples < 1:
+            raise ValueError("timing_search_step_samples must be >= 1")
         if not (0.0 <= self.template_trim_fraction < 0.5):
             raise ValueError("template_trim_fraction must be in [0, 0.5)")
         if not (-1.0 <= self.template_min_correlation <= 1.0):

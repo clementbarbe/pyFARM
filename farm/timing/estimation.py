@@ -40,6 +40,9 @@ def estimate_initial_timing(
     vol_onsets: np.ndarray,
     n_sg: int,
     n_vol: int,
+    *,
+    dtime_max_ms: float | None = None,
+    search_step_samples: int = 16,
 ) -> tuple:
     """Estimate initial *sdur* and *dtime* by scanning each volume.
 
@@ -63,8 +66,20 @@ def estimate_initial_timing(
     """
     ref_250 = hpf_butter_1d(ref_signal, srate, 250.0)
     n_sample_per_tr = int(np.median(np.diff(vol_onsets)))
-    dtime_max = int(round(n_sample_per_tr / n_sg / 2))
-    dtime_candidates = np.arange(dtime_max + 1, dtype=np.int64)
+    if dtime_max_ms is None:
+        # Historical selection unchanged for reproducible default outputs.
+        dtime_max = int(round(n_sample_per_tr / n_sg / 2))
+        dtime_candidates = np.arange(dtime_max + 1, dtype=np.int64)
+    else:
+        # Explicitly constrained extended dead-time search.
+        if dtime_max_ms <= 0 or search_step_samples < 1:
+            raise ValueError("Invalid expanded timing search")
+        dtime_max = min(int(round(dtime_max_ms * 1e-3 * srate)),
+                        max(0, n_sample_per_tr - 8 * n_sg))
+        dtime_candidates = np.arange(0, dtime_max + 1,
+                                     search_step_samples, dtype=np.int64)
+        if dtime_candidates[-1] != dtime_max:
+            dtime_candidates = np.append(dtime_candidates, dtime_max)
 
     sdur_list, dtime_list, sv_list = [], [], []
 
@@ -82,6 +97,15 @@ def estimate_initial_timing(
             sv = _vol_variance(ref_250, vol_start, vol_dur, int(dt), n_sg)
             if sv < best_sv:
                 best_sv, best_dt = sv, int(dt)
+        if dtime_max_ms is not None and search_step_samples > 1:
+            lo = max(0, best_dt - search_step_samples)
+            hi = min(dtime_max, best_dt + search_step_samples)
+            for fine_dt in range(lo, hi + 1):
+                if fine_dt >= vol_dur:
+                    break
+                sv = _vol_variance(ref_250, vol_start, vol_dur, fine_dt, n_sg)
+                if sv < best_sv:
+                    best_sv, best_dt = sv, fine_dt
         sdur_list.append((vol_dur - best_dt) / n_sg / srate)
         dtime_list.append(best_dt / srate)
         sv_list.append(best_sv)
@@ -94,6 +118,10 @@ def estimate_initial_timing(
     sdur_init = float(np.median(sdur_arr))
     dtime_init = float(np.median(dtime_arr))
 
+    if np.median(dtime_arr) >= (dtime_max - 2) / srate:
+        logger.warning("Timing dead-time estimate is near the upper search "
+                       "bound (%.3f ms); investigate protocol metadata",
+                       dtime_max / srate * 1e3)
     sdur_mad = float(np.median(np.abs(sdur_arr - sdur_init)))
     dtime_mad = float(np.median(np.abs(dtime_arr - dtime_init)))
 

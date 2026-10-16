@@ -61,6 +61,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--template-min-corr", type=float, default=-1.0)
     p.add_argument("--template-trim", type=float, default=0.0)
+    p.add_argument("--template-method", choices=("mean", "trimmed", "median", "huber"), default="mean")
+    p.add_argument("--template-huber-delta", type=float, default=1.5)
+    p.add_argument("--pca-mode", choices=("current", "disabled", "conservative"), default="current")
+    p.add_argument("--export-gap-mask", action="store_true")
+    p.add_argument("--gap-mask-guard-samples", type=int, default=16)
+    p.add_argument("--timing-dtime-max-ms", type=float, default=None)
+    p.add_argument("--timing-search-step-samples", type=int, default=16)
     p.add_argument("--pca-artifact-corr", type=float, default=0.10)
     p.add_argument("--pca-max-components", type=int, default=6)
     p.add_argument(
@@ -96,6 +103,13 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         fixed_sdur_seconds=(None if args.fixed_sdur_ms is None else args.fixed_sdur_ms / 1000.0),
         template_min_correlation=args.template_min_corr,
         template_trim_fraction=args.template_trim,
+        template_method=args.template_method,
+        template_huber_delta=args.template_huber_delta,
+        pca_mode=args.pca_mode,
+        export_gap_mask=args.export_gap_mask,
+        gap_mask_guard_samples=args.gap_mask_guard_samples,
+        timing_dtime_max_ms=args.timing_dtime_max_ms,
+        timing_search_step_samples=args.timing_search_step_samples,
         pca_artifact_corr_threshold=args.pca_artifact_corr,
         pca_max_components=args.pca_max_components,
         zero_fill_gap_fraction=args.zero_fill_gap_fraction,

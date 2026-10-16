@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from farm.utils.signal import corr_with_matrix
+from farm.templates.robust import aggregate_template
 
 
 def _trimmed_mean_rows(x: np.ndarray, trim_fraction: float) -> np.ndarray:
@@ -37,6 +38,8 @@ def build_artifact_templates(
     trim_fraction: float = 0.0,
     min_correlation: float = -1.0,
     scale_bounds: tuple[float, float] | None = None,
+    method: str = "mean",
+    huber_delta: float = 1.5,
 ) -> np.ndarray:
     """Build one artifact template per valid acquisition-group occurrence.
 
@@ -83,8 +86,9 @@ def build_artifact_templates(
             continue
 
         selected_rows = candidate_rows[top]
-        template = _trimmed_mean_rows(
-            aligned_segments[selected_rows], trim_fraction=float(trim_fraction)
+        template = aggregate_template(
+            aligned_segments[selected_rows], method=method,
+            trim_fraction=float(trim_fraction), huber_delta=float(huber_delta),
         )
 
         denominator = float(np.dot(template[window], template[window]))

@@ -79,6 +79,8 @@ def extract_aligned_segments(
     round_errors: np.ndarray,
     padding: int = 10,
     indices: np.ndarray | None = None,
+    *,
+    include_padding: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract segments then align them to their exact fractional onsets.
 
@@ -126,6 +128,8 @@ def extract_aligned_segments(
 
     indices = np.asarray(indices, dtype=np.int64)
     half = int(padding // 2)
+    if half < 0:
+        raise ValueError("padding must be >= 0")
 
     segs = []
     valid_idx = []
@@ -137,15 +141,23 @@ def extract_aligned_segments(
         start = int(onsets[idx]) - half
         stop = int(onsets[idx]) + seg_len + half
 
-        if start < 0 or stop > len(signal_1d):
+        core_start = int(onsets[idx])
+        if core_start < 0 or core_start + seg_len > len(signal_1d):
             continue
-
-        segs.append(signal_1d[start:stop])
+        segment = signal_1d[max(0, start):min(stop, len(signal_1d))]
+        # Reflect context at recording edges rather than skipping the first
+        # acquisition group. The actual science samples are never padded.
+        if start < 0 or stop > len(signal_1d):
+            segment = np.pad(
+                segment, (max(0, -start), max(0, stop - len(signal_1d))),
+                mode="reflect" if len(segment) > 1 else "edge",
+            )
+        segs.append(segment)
         valid_idx.append(int(idx))
 
     if not segs:
         return (
-            np.empty((0, seg_len), dtype=np.float32),
+            np.empty((0, seg_len + 2 * half if include_padding else seg_len), dtype=np.float32),
             np.empty(0, dtype=np.int64),
         )
 
@@ -155,7 +167,41 @@ def extract_aligned_segments(
     # Important: negative sign, see docstring.
     shifted = fft_shift(segs_arr, -round_errors[valid_arr])
 
+    if include_padding:
+        return shifted.astype(np.float32), valid_arr
     return shifted[:, half:half + seg_len].astype(np.float32), valid_arr
+
+
+def restore_artifact_segments(
+    segments: np.ndarray,
+    onsets: np.ndarray,
+    round_errors: np.ndarray,
+    valid_idx: np.ndarray,
+    stops: np.ndarray,
+    signal_length: int,
+    padding: int,
+) -> np.ndarray:
+    """Undo alignment on padded *artifact* estimates and restore native times.
+
+    Adjacent intervals have one owner per sample. Keeping their true rounded
+    stops avoids one-sample holes/overlaps when a group duration is fractional.
+    This function never shifts or rewrites the physiological measurement.
+    """
+    half = int(padding // 2)
+    restored = fft_shift(segments, np.asarray(round_errors)[valid_idx])
+    result = np.zeros(signal_length, dtype=np.float32)
+    for row, idx in enumerate(valid_idx):
+        start = int(onsets[idx])
+        stop = min(int(stops[idx]), signal_length)
+        if idx + 1 < len(onsets):
+            stop = min(stop, int(onsets[idx + 1]))
+        width = stop - start
+        if start < 0 or width <= 0:
+            continue
+        if half + width > restored.shape[1]:
+            raise ValueError("Insufficient artifact padding for interval length")
+        result[start:stop] = restored[row, half:half + width]
+    return result
 
 
 def extract_plain_segments(

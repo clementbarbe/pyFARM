@@ -29,7 +29,7 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / den)
 
 
-def _artifact_basis(noise_matrix: np.ndarray, max_basis: int = 8) -> list[np.ndarray]:
+def _artifact_basis(noise_matrix: np.ndarray, max_basis: int = 4) -> list[np.ndarray]:
     """Build a compact temporal basis from estimated artifact segments.
 
     Parameters
@@ -52,7 +52,7 @@ def _artifact_basis(noise_matrix: np.ndarray, max_basis: int = 8) -> list[np.nda
         if len(S):
             energy = S * S
             pct = 100.0 * energy / (energy.sum() + 1e-30)
-            keep = np.flatnonzero(pct > 1.0)[: int(max_basis)]
+            keep = np.flatnonzero(pct > 5.0)[: int(max_basis)]
             basis.extend(U[:, int(k)] for k in keep)
 
     # Timing jitter commonly appears as temporal derivatives of the artifact.
@@ -71,6 +71,27 @@ def _artifact_similarity(vector: np.ndarray, basis: list[np.ndarray]) -> float:
     return max(abs(_safe_corr(vector, b)) for b in basis)
 
 
+def _orthonormal_basis(basis: list[np.ndarray]) -> np.ndarray:
+    """Orthonormalize without introducing directions for dependent columns."""
+    columns = []
+    for vector in basis:
+        vector = vector - np.mean(vector)
+        norm = np.linalg.norm(vector)
+        if norm > 1e-20:
+            columns.append(vector / norm)
+    if not columns:
+        return np.empty((len(basis[0]), 0)) if basis else np.empty((0, 0))
+    U, S, _ = np.linalg.svd(np.column_stack(columns), full_matrices=False)
+    return U[:, S > S[0] * 1e-6]
+
+
+def _confidence_weight(similarity: float, threshold: float) -> float:
+    """Avoid a full correction appearing abruptly at a similarity threshold."""
+    if threshold >= 1.0:
+        return float(similarity >= threshold)
+    return float(np.clip((similarity - threshold) / (1.0 - threshold), 0.0, 1.0))
+
+
 def pca_cleanup(
     vol_clean_signal: np.ndarray,
     vol_noise_signal: np.ndarray,
@@ -85,11 +106,12 @@ def pca_cleanup(
     var_threshold: float = 5.0,
     *,
     n_sg: int | None = None,
-    artifact_corr_threshold: float = 0.10,
-    mean_corr_threshold: float = 0.10,
+    artifact_corr_threshold: float = 0.60,
+    mean_corr_threshold: float = 0.80,
     mean_repeatability_threshold: float = 0.20,
-    max_components: int = 6,
+    max_components: int = 4,
     groupwise: bool = False,
+    segment_stops: np.ndarray | None = None,
 ) -> np.ndarray:
     """Remove scanner-like high-frequency residual components section-wise.
 
@@ -132,23 +154,21 @@ def pca_cleanup(
 
     clean_signal = vol_clean_signal.copy()
     clean_signal[scan_start_up:scan_stop_up] = subtracted[scan_start_up:scan_stop_up]
-    if len(valid_pca) < 2:
+    # Zero really disables the entire residual cleanup, including mean removal.
+    if int(max_components) == 0 or len(valid_pca) < 2:
         return clean_signal.astype(np.float32)
 
-    scan_duration = (
-        onsets_up[-1] + 2 * int(seg_len) + int(dtime_samp_up) - onsets_up[0]
-    ) / float(srate_up)
-    n_sections = max(1, int(round(scan_duration / float(time_section))))
-    rows = np.arange(len(valid_pca), dtype=np.int64)
-    rows_per_section = len(rows) / n_sections
+    section_ids = np.floor(
+        (onsets_up[valid_pca] - scan_start_up) / (srate_up * time_section)
+    ).astype(np.int64)
+    sections = np.unique(section_ids)
+    n_sections = len(sections)
 
     total_components = 0
     mean_removed_sections = 0
 
-    for sec in range(n_sections):
-        start_row = int(round(sec * rows_per_section))
-        stop_row = int(round((sec + 1) * rows_per_section))
-        sec_rows = rows[start_row:stop_row]
+    for sec in sections:
+        sec_rows = np.flatnonzero(section_ids == sec)
         if len(sec_rows) < 2:
             continue
 
@@ -160,6 +180,7 @@ def pca_cleanup(
         mean_art = M0.mean(axis=1)
         residual = M0 - mean_art[:, None]
         basis = _artifact_basis(N)
+        Q = _orthonormal_basis(basis)
 
         # Repeated section mean is removed only when the artifact templates
         # support it.  With no artifact reference, nothing is removed.
@@ -172,25 +193,34 @@ def pca_cleanup(
             and mean_similarity >= float(mean_corr_threshold)
             and mean_repeatability >= float(mean_repeatability_threshold)
         )
-        mean_to_remove = mean_art if remove_mean else np.zeros_like(mean_art)
+        # A component may mix physiology and artifact. Remove only its part
+        # supported by the artifact subspace, never the whole mixed waveform.
+        mean_to_remove = (
+            _confidence_weight(mean_similarity, mean_corr_threshold) * Q @ (Q.T @ mean_art)
+            if remove_mean else np.zeros_like(mean_art)
+        )
         if remove_mean:
             mean_removed_sections += 1
 
         fitted = np.zeros_like(residual)
         selected: list[int] = []
+        weights: list[float] = []
         if basis and np.any(np.abs(residual) > 0):
             U, S, _ = np.linalg.svd(residual, full_matrices=False)
             eig = S * S
             var_pct = 100.0 * eig / (eig.sum() + 1e-30)
             eligible = np.flatnonzero(var_pct > float(var_threshold))
-            if int(max_components) > 0:
-                eligible = eligible[: int(max_components)]
             for k in eligible:
-                if _artifact_similarity(U[:, int(k)], basis) >= float(artifact_corr_threshold):
+                similarity = _artifact_similarity(U[:, int(k)], basis)
+                if similarity >= float(artifact_corr_threshold):
                     selected.append(int(k))
+                    weights.append(_confidence_weight(similarity, artifact_corr_threshold))
+                    if len(selected) == int(max_components):
+                        break
             if selected:
                 Uk = U[:, selected]
-                fitted = Uk @ (Uk.T @ residual)
+                supported = Q @ (Q.T @ Uk)
+                fitted = (supported * np.asarray(weights)[None, :]) @ (Uk.T @ residual)
 
         total_components += len(selected)
 
@@ -198,10 +228,15 @@ def pca_cleanup(
             slice_idx = int(valid_pca[row_idx])
             start = int(onsets_up[slice_idx])
             stop = start + int(seg_len)
-            if 0 <= start and stop <= len(clean_signal):
+            stop = min(stop, scan_stop_up)
+            if segment_stops is not None:
+                stop = min(stop, int(segment_stops[slice_idx]))
+            if slice_idx + 1 < len(onsets_up):
+                stop = min(stop, int(onsets_up[slice_idx + 1]))
+            if scan_start_up <= start < stop <= len(clean_signal):
                 correction = fitted[:, j] + mean_to_remove
                 clean_signal[start:stop] = (
-                    sub_segs_raw[row_idx].astype(np.float64) - correction
+                    sub_segs_raw[row_idx, :stop-start].astype(np.float64) - correction[:stop-start]
                 ).astype(np.float32)
 
         logger.debug(

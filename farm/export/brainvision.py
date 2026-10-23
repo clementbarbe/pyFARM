@@ -5,8 +5,41 @@ from pathlib import Path
 
 import numpy as np
 import mne
+from mne.io.constants import FIFF
 
 logger = logging.getLogger("farm.export.brainvision")
+
+
+def _annotation_events(raw: mne.io.Raw) -> list[dict]:
+    """Convert annotations to integer samples by rounding, never truncation.
+
+    A mathematically integral timestamp can multiply back to e.g. 930622.99999.
+    Truncation in MNE's generic export path then moves its marker one sample.
+    pybv accepts explicit sample positions, avoiding this timing distortion.
+    """
+    onsets = raw.time_as_index(raw.annotations.onset - raw.first_time,
+                               use_rounding=True)
+    events = []
+    for onset, annotation in zip(onsets, raw.annotations):
+        onset = int(onset)
+        if not 0 <= onset < raw.n_times:
+            raise ValueError("Annotation onset outside the recording cannot be exported")
+        duration = min(int(round(annotation["duration"] * raw.info["sfreq"])),
+                       raw.n_times - onset)
+        description = annotation["description"]
+        event_type = "Comment"
+        for prefix, kind in [("Stimulus/S", "Stimulus"), ("Response/R", "Response")]:
+            if description.startswith(prefix) and description[len(prefix):].strip().isdigit():
+                description = int(description[len(prefix):].strip())
+                event_type = kind
+                break
+        if isinstance(description, str) and description.startswith("Comment/"):
+            description = description[len("Comment/"):]
+        event = dict(onset=onset, duration=duration, description=description, type=event_type)
+        if annotation.get("ch_names"):
+            event["channels"] = list(annotation["ch_names"])
+        events.append(event)
+    return events
 
 
 def export_brainvision(
@@ -39,23 +72,27 @@ def export_brainvision(
     for local_index, raw_channel_index in enumerate(ch_indices):
         raw_data[raw_channel_index] = clean[local_index].astype(np.float64)
 
-    raw_export = mne.io.RawArray(
-        raw_data,
-        raw_original.info.copy(),
-        first_samp=raw_original.first_samp,
-        verbose=False,
-    )
-    raw_export.set_annotations(raw_original.annotations.copy())
-
     try:
-        mne.export.export_raw(vhdr_path, raw_export, overwrite=True, verbose=False)
-    except RuntimeError as exc:
-        if "pybv" in str(exc).lower():
-            raise RuntimeError(
-                "BrainVision export requires 'pybv'. Install the project with "
-                "`python -m pip install -e .` (pybv is a required dependency)."
-            ) from exc
-        raise
+        from pybv import write_brainvision
+    except ImportError as exc:
+        raise RuntimeError(
+            "BrainVision export requires 'pybv'. Install with `python -m pip install -e .`."
+        ) from exc
+    # Match the calibrated-unit policy of MNE's BrainVision exporter. Only
+    # voltage channels are rescaled; other physical measurements remain in SI.
+    units = {FIFF.FIFF_UNIT_V: "µV", FIFF.FIFF_UNIT_CEL: "°C",
+             FIFF.FIFF_UNIT_T: "T", FIFF.FIFF_UNIT_T_M: "T/m",
+             FIFF.FIFF_UNIT_MOL: "M", FIFF.FIFF_UNIT_S: "S",
+             FIFF.FIFF_UNIT_SEC: "s"}
+    if hasattr(FIFF, "FIFF_UNIT_PX"):
+        units[FIFF.FIFF_UNIT_PX] = "px"
+    write_brainvision(
+        data=raw_data, sfreq=float(raw_original.info["sfreq"]),
+        ch_names=raw_original.ch_names, fname_base=basename, folder_out=str(out),
+        overwrite=True, events=_annotation_events(raw_original),
+        resolution=0.1, unit=[units.get(ch["unit"], "n/a") for ch in raw_original.info["chs"]],
+        fmt="binary_float32", meas_date=raw_original.info["meas_date"],
+    )
 
     logger.info("BrainVision exported: %s", vhdr_path)
     return vhdr_path

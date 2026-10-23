@@ -192,7 +192,7 @@ def optimize_global_timing(
     observed_intervals = np.diff(vol_onsets_up[:n_vol]).astype(np.float64)
     tr_samples_median = float(np.median(observed_intervals))
     tr_seconds_median = tr_samples_median / srate_up
-    max_sdur = 0.999 * tr_seconds_median / n_sg
+    max_sdur = float(np.min(observed_intervals)) / srate_up / n_sg
 
     lower = max(8.0 / srate_up, sdur_init - refine_half_width_seconds)
     upper = min(max_sdur, sdur_init + refine_half_width_seconds)
@@ -225,12 +225,16 @@ def optimize_global_timing(
     relative_improvement = (cost_init - cost_candidate) / (abs(cost_init) + 1e-30)
 
     width = upper - lower
-    edge_tol = max(5.0 / srate_up, 0.02 * width)
+    # Resolution is in duration-per-group units. Five samples used to mark
+    # the *whole* interval as an edge at modest sampling rates.
+    edge_tol = min(0.1 * width, max(1.0 / (srate_up * n_sg), 0.02 * width))
     hits_edge = (candidate - lower <= edge_tol) or (upper - candidate <= edge_tol)
 
     accepted = (
         bool(result.success)
         and np.isfinite(cost_candidate)
+        and cost_candidate < 1e19
+        and np.isfinite(cost_init)
         and not hits_edge
         and relative_improvement >= min_relative_improvement
     )

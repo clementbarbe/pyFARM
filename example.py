@@ -1,4 +1,4 @@
-"""Minimal single-run example for the validated 54-slice / MB3 protocol."""
+"""Minimal single-run example for a 54-slice / MB3 protocol."""
 from farm.config import FARMConfig
 from farm.workflow import run_pipeline
 
@@ -10,9 +10,9 @@ cfg = FARMConfig(
     trigger="R128",
     ch_regex=r"EXT|FLE",
     drop_last_volume=True,
-    # This acquisition shows a strong scanner-locked inter-volume boundary
-    # artifact; the complete measured gap is therefore masked.
-    zero_fill_gap_fraction=1.0,
+    # Dedicated gap templates preserve measured EMG between volumes.
+    correct_volume_gaps=True,
+    zero_fill_gap_fraction=0.0,
     output_dir="denoised",
 )
 

@@ -24,6 +24,7 @@ class FARMConfig:
     n_slices: int = 54
     mb_factor: int = 3
     trigger: str = "R128"
+    trigger_tolerance_seconds: float = 0.005
     ch_regex: str = r"EXT|FLE"
 
     # FARM processing
@@ -35,10 +36,12 @@ class FARMConfig:
     time_section: float = 60.0
     var_threshold: float = 5.0
 
-    # Artifact / timing branches.  The validated protocol uses the same HPF
-    # for both, reproducing the stable timing minimum of the legacy pipeline.
+    # Artifact / timing branches; neither replaces the science measurement.
     artifact_hpf_cutoff: float = 30.0
     timing_hpf_cutoff: float = 30.0
+    timing_reference_hpf: float = 250.0
+    # Coarse search is bounded by the sequence, not an arbitrary half-group.
+    timing_max_gap_seconds: float = 0.2
 
     # Timing policy. ``initial`` is the safe default for fixed EPI protocols:
     # it uses the robust per-volume estimate and never lets a later numerical
@@ -51,23 +54,21 @@ class FARMConfig:
     fixed_sdur_seconds: Optional[float] = None
 
     # Artifact-specific global PCA
-    pca_artifact_corr_threshold: float = 0.10
-    pca_mean_corr_threshold: float = 0.10
+    pca_artifact_corr_threshold: float = 0.60
+    pca_mean_corr_threshold: float = 0.80
     pca_mean_repeatability_threshold: float = 0.20
-    pca_max_components: int = 6
+    pca_max_components: int = 4
     pca_groupwise: bool = False
 
-    # Adaptive template construction.  These defaults preserve the validated
-    # FARM-like top-N arithmetic mean while keeping the corrected last-group
-    # correlation window.
-    template_trim_fraction: float = 0.0
-    template_min_correlation: float = -1.0
-    template_scale_bounds: Optional[Tuple[float, float]] = None
+    # Reject unrelated segments; robust averaging limits transient EMG leakage.
+    template_trim_fraction: float = 0.10
+    template_min_correlation: float = 0.80
+    template_scale_bounds: Optional[Tuple[float, float]] = (0.0, 2.0)
+    correct_volume_gaps: bool = True
 
     padding: int = 10
 
-    # Generic default is conservative.  For protocols with a demonstrated
-    # scanner-locked boundary artifact (such as the supplied dataset), set 1.0.
+    # Explicit destructive masking only. Prefer dedicated gap templates.
     zero_fill_gap_fraction: float = 0.0
 
     # QC band only.  It NEVER modifies the exported denoised waveform.
@@ -106,6 +107,8 @@ class FARMConfig:
             raise ValueError("vhdr_path must be set")
         if self.tr <= 0:
             raise ValueError("tr must be positive")
+        if self.trigger_tolerance_seconds <= 0:
+            raise ValueError("trigger_tolerance_seconds must be positive")
         if self.n_slices <= 0:
             raise ValueError("n_slices must be positive")
         if self.mb_factor < 1:
@@ -114,10 +117,14 @@ class FARMConfig:
             raise ValueError("interp_factor must be >= 1")
         if self.window_size < 1:
             raise ValueError("window_size must be >= 1 volume")
-        if self.n_candidates < 1:
-            raise ValueError("n_candidates must be >= 1")
+        if self.n_candidates < 2:
+            raise ValueError("n_candidates must be >= 2 for disjoint template averages")
         if self.time_section <= 0:
             raise ValueError("time_section must be positive")
+        if self.n_volumes is not None and self.n_volumes < 2:
+            raise ValueError("n_volumes must be >= 2")
+        if self.timing_max_gap_seconds <= 0 or self.timing_max_gap_seconds >= self.tr:
+            raise ValueError("timing_max_gap_seconds must be > 0 and < tr")
         if not (0.0 < self.var_threshold <= 100.0):
             raise ValueError("var_threshold must be in ]0, 100]")
         if self.timing_mode not in {"initial", "local", "fixed"}:
@@ -167,6 +174,7 @@ class FARMConfig:
         for name, freq in {
             "artifact_hpf_cutoff": self.artifact_hpf_cutoff,
             "timing_hpf_cutoff": self.timing_hpf_cutoff,
+            "timing_reference_hpf": self.timing_reference_hpf,
             "qc_band low": self.qc_bandpass[0],
             "qc_band high": self.qc_bandpass[1],
         }.items():

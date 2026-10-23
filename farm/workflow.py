@@ -38,10 +38,10 @@ from farm.timing.optimization import (
 # ── Correction bricks ────────────────────────────────────────
 from farm.alignment.phase_shift import (
     extract_aligned_segments,
-    overwrite_segments,
+    restore_artifact_segments,
 )
 from farm.templates.subtraction import build_artifact_templates
-from farm.templates.zerofill import zero_fill_dtime
+from farm.templates.zerofill import gap_mask_intervals
 from farm.pca.cleanup import pca_cleanup
 
 # ── Diagnostics ──────────────────────────────────────────────
@@ -49,6 +49,7 @@ from farm.diagnostics.segments import diagnose_segments
 from farm.diagnostics.metrics import (
     compute_rms_reduction,
     compute_scanner_locked_reduction,
+    compute_gradient_harmonic_reduction,
 )
 
 # ── Export ───────────────────────────────────────────────────
@@ -101,6 +102,46 @@ def _select_reference_channel(
 # Private: per-channel FARM correction
 # ═══════════════════════════════════════════════════════════════
 
+def _estimate_interval_artifact(
+    reference: np.ndarray,
+    onsets: np.ndarray,
+    errors: np.ndarray,
+    stops: np.ndarray,
+    slice_info: dict,
+    cfg: FARMConfig,
+    diagnostics: dict,
+) -> np.ndarray:
+    """Estimate supported templates and restore only those to original times."""
+    widths = stops - onsets
+    eligible = np.flatnonzero(widths >= 8)
+    diagnostics["interval_count"] = int(len(eligible))
+    diagnostics["templates_applied"] = 0
+    if len(eligible) < 3 or not np.any(reference):
+        return np.zeros_like(reference)
+    core_len = int(np.min(widths[eligible]))
+    padding = max(cfg.padding, 2 * (int(np.max(widths[eligible])) - core_len + 2))
+    segments, valid = extract_aligned_segments(
+        reference, onsets, core_len, errors, padding=padding,
+        indices=eligible, include_padding=True,
+    )
+    if not len(valid):
+        return np.zeros_like(reference)
+    templates = build_artifact_templates(
+        segments, valid, slice_info, cfg.n_candidates, 0, core_len,
+        trim_fraction=cfg.template_trim_fraction,
+        min_correlation=cfg.template_min_correlation,
+        scale_bounds=cfg.template_scale_bounds,
+        padding=padding,
+    )
+    half = padding // 2
+    diagnostics["templates_applied"] = int(np.count_nonzero(
+        np.any(templates[:, half:half + core_len] != 0, axis=1)
+    ))
+    return restore_artifact_segments(
+        templates, onsets, errors, valid, stops, len(reference), padding,
+    )
+
+
 def _correct_channel(
     ch_science_signal: np.ndarray,
     ch_artifact_signal: np.ndarray,
@@ -115,178 +156,74 @@ def _correct_channel(
     srate_up: float,
     ch_name: str = "",
     fig_dir: Path | None = None,
+    diagnostics: dict | None = None,
 ) -> np.ndarray:
-    """Run FARM correction on a single upsampled channel.
+    """Subtract artifact estimates on the unshifted science time grid.
 
-    Processing:
-        iii.  Fractional-sample phase alignment
-        v.    Adaptive template construction/subtraction
-        iv.   Inter-volume dead-time masking
-        vi.   PCA residual cleanup
-
-    Notes
-    -----
-    ``artifact_signal`` must start from zeros, not from a copy of ``signal``.
-    Otherwise, in regions without a valid template, this would occur::
-
-        subtracted = signal - artifact_signal = signal - signal = 0
-
-    and valid EMG data could be removed during PCA cleanup.
+    Fractional alignment is used only to estimate templates. Padded templates
+    are shifted back before subtraction. No alignment or interpolation is
+    applied to the physiological measurement. Explicit destructive gap masking
+    is deferred to the native-rate output, after all filtering.
     """
-    signal = np.asarray(ch_science_signal, dtype=np.float32).copy()
-    artifact_reference = np.asarray(ch_artifact_signal, dtype=np.float32).copy()
-
-    # ── (iii) Fractional phase alignment ─────────────────────
-    aligned_segs, valid_idx = extract_aligned_segments(
-        signal_1d=signal,
-        onsets=onsets_up,
-        seg_len=seg_len,
-        round_errors=round_errors,
-        padding=cfg.padding,
+    signal = np.asarray(ch_science_signal, dtype=np.float32)
+    reference = np.asarray(ch_artifact_signal, dtype=np.float32)
+    stats = diagnostics if diagnostics is not None else {}
+    exact = onsets_up.astype(np.float64) + round_errors
+    within_volume = ~slice_info["is_last"][:-1]
+    duration = (
+        float(np.median(np.diff(exact)[within_volume]))
+        if np.any(within_volume) else float(seg_len)
+    )
+    stops = np.minimum(np.rint(exact + duration).astype(np.int64), scan_stop_up)
+    stops[:-1] = np.minimum(stops[:-1], onsets_up[1:])
+    stats["slice_templates"] = {}
+    artifact = _estimate_interval_artifact(
+        reference, onsets_up, round_errors, stops, slice_info, cfg,
+        stats["slice_templates"],
     )
 
-    if len(valid_idx) == 0:
-        logger.warning(
-            "Channel %s: no valid aligned segments; skipping correction.",
-            ch_name,
-        )
-        return signal
+    # Volume-boundary artifacts get their own templates. They do not enter the
+    # slice-group averages and the recorded EMG in the gap is never synthesized.
+    stats["gap_templates"] = {"interval_count": 0, "templates_applied": 0}
+    if cfg.correct_volume_gaps:
+        last = np.asarray(slice_info["last_slice_idx"], dtype=np.int64)
+        gap_onsets = stops[last]
+        gap_stops = np.array([
+            onsets_up[k + 1] if k + 1 < len(onsets_up) else scan_stop_up
+            for k in last
+        ], dtype=np.int64)
+        keep = gap_stops - gap_onsets >= 8
+        gap_errors = (exact[last] + duration - gap_onsets)[keep]
+        gap_onsets, gap_stops = gap_onsets[keep], gap_stops[keep]
+        if len(gap_onsets) >= 3:
+            gap_info = build_slice_info(len(gap_onsets), 1, cfg.window_size)
+            artifact += _estimate_interval_artifact(
+                reference, gap_onsets, gap_errors, gap_stops, gap_info, cfg,
+                stats["gap_templates"],
+            )
 
-    artifact_aligned, artifact_valid_idx = extract_aligned_segments(
-        signal_1d=artifact_reference,
-        onsets=onsets_up,
-        seg_len=seg_len,
-        round_errors=round_errors,
-        padding=cfg.padding,
-        indices=valid_idx,
-    )
-
-    if not np.array_equal(valid_idx, artifact_valid_idx):
-        common = np.intersect1d(valid_idx, artifact_valid_idx)
-        science_rows = {int(v): i for i, v in enumerate(valid_idx)}
-        artifact_rows = {int(v): i for i, v in enumerate(artifact_valid_idx)}
-        aligned_segs = aligned_segs[[science_rows[int(v)] for v in common]]
-        artifact_aligned = artifact_aligned[[artifact_rows[int(v)] for v in common]]
-        valid_idx = common.astype(np.int64)
-
-    # Replace science slice segments by their phase-aligned equivalents.
-    signal = overwrite_segments(
-        signal_1d=signal,
-        onsets=onsets_up,
-        segments=aligned_segs,
-        seg_indices=valid_idx,
-    )
-
-    if fig_dir is not None:
-        diagnose_segments(
-            signal,
-            onsets_up,
-            seg_len,
-            ch_name,
-            "After (iii) phase-shift",
-            fig_dir,
-        )
-
-    # ── (v) Adaptive artifact-template construction ──────────
-    artifact_segs = build_artifact_templates(
-        aligned_segments=artifact_aligned,
-        valid_idx=valid_idx,
-        slice_info=slice_info,
-        n_candidates=cfg.n_candidates,
-        dtime_samp_up=dtime_samp_up,
-        seg_len=seg_len,
-        trim_fraction=cfg.template_trim_fraction,
-        min_correlation=cfg.template_min_correlation,
-        scale_bounds=cfg.template_scale_bounds,
-    )
-
-    # Important: artifact estimate is zero everywhere by default.
-    # Only valid slice-segment regions receive a template estimate.
-    artifact_signal = np.zeros_like(signal, dtype=np.float32)
-
-    artifact_signal = overwrite_segments(
-        signal_1d=artifact_signal,
-        onsets=onsets_up,
-        segments=artifact_segs,
-        seg_indices=valid_idx,
-    )
-
-    if fig_dir is not None:
-        sub_diag = signal.copy()
-        sub_diag[scan_start_up:scan_stop_up] -= (
-            artifact_signal[scan_start_up:scan_stop_up]
-        )
-
-        diagnose_segments(
-            sub_diag,
-            onsets_up,
-            seg_len,
-            ch_name,
-            "After (v) templates",
-            fig_dir,
-        )
-        del sub_diag
-
-    # ── (iv) Zero-fill only true inter-volume gaps ───────────
-    signal_zf = zero_fill_dtime(
-        signal=signal,
-        onsets_up=onsets_up,
-        last_slice_idx=slice_info["last_slice_idx"],
-        seg_len=seg_len,
-        dtime_samp_up=dtime_samp_up,
-        gap_fraction=cfg.zero_fill_gap_fraction,
-    )
-
-    artifact_zf = zero_fill_dtime(
-        signal=artifact_signal,
-        onsets_up=onsets_up,
-        last_slice_idx=slice_info["last_slice_idx"],
-        seg_len=seg_len,
-        dtime_samp_up=dtime_samp_up,
-        gap_fraction=cfg.zero_fill_gap_fraction,
-    )
-
-    if fig_dir is not None:
-        diagnose_segments(
-            signal_zf,
-            onsets_up,
-            seg_len,
-            ch_name,
-            f"After (iv) gap mask ({cfg.zero_fill_gap_fraction:.2f})",
-            fig_dir,
-        )
-
-    # ── (vi) PCA residual cleanup ────────────────────────────
+    valid = np.flatnonzero((onsets_up >= scan_start_up) &
+                           (onsets_up + seg_len <= scan_stop_up))
     clean = pca_cleanup(
-        vol_clean_signal=signal_zf,
-        vol_noise_signal=artifact_zf,
-        onsets_up=onsets_up,
-        seg_len=seg_len,
-        valid_idx=valid_idx,
-        srate_up=srate_up,
-        scan_start_up=scan_start_up,
-        scan_stop_up=scan_stop_up,
-        dtime_samp_up=dtime_samp_up,
-        time_section=cfg.time_section,
-        var_threshold=cfg.var_threshold,
-        n_sg=cfg.n_sg,
-        artifact_corr_threshold=cfg.pca_artifact_corr_threshold,
+        vol_clean_signal=signal, vol_noise_signal=artifact,
+        onsets_up=onsets_up, seg_len=seg_len, valid_idx=valid,
+        srate_up=srate_up, scan_start_up=scan_start_up,
+        scan_stop_up=scan_stop_up, dtime_samp_up=dtime_samp_up,
+        time_section=cfg.time_section, var_threshold=cfg.var_threshold,
+        n_sg=cfg.n_sg, artifact_corr_threshold=cfg.pca_artifact_corr_threshold,
         mean_corr_threshold=cfg.pca_mean_corr_threshold,
         mean_repeatability_threshold=cfg.pca_mean_repeatability_threshold,
-        max_components=cfg.pca_max_components,
-        groupwise=cfg.pca_groupwise,
+        max_components=cfg.pca_max_components, groupwise=cfg.pca_groupwise,
+        segment_stops=stops,
     )
-
+    stats["template_correction_rms"] = float(np.sqrt(np.mean(artifact.astype(np.float64)**2)))
+    stats["pca_correction_rms"] = float(np.sqrt(np.mean(
+        (signal.astype(np.float64) - artifact - clean)**2
+    )))
     if fig_dir is not None:
-        diagnose_segments(
-            clean,
-            onsets_up,
-            seg_len,
-            ch_name,
-            "After (vi) PCA",
-            fig_dir,
-        )
-
+        diagnose_segments(signal - artifact, onsets_up, seg_len, ch_name,
+                          "After templates (original time grid)", fig_dir)
+        diagnose_segments(clean, onsets_up, seg_len, ch_name, "After PCA", fig_dir)
     return clean.astype(np.float32)
 
 
@@ -346,6 +283,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         tr=cfg.tr,
         n_volumes=cfg.n_volumes,
         drop_last=cfg.drop_last_volume,
+        max_interval_error_seconds=cfg.trigger_tolerance_seconds,
     )
 
     if cfg.drop_last_volume:
@@ -432,9 +370,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     t0 = time.time()
 
-    # Keep an untouched science branch, but derive scanner timing/templates
-    # from the same 30-Hz HPF branch used by the proven legacy implementation.
-    # The final EMG band is imposed only once, after FARM correction.
+    # Only the estimated correction will be resampled back. Native science
+    # samples stay intact and are not forced into a downstream analysis band.
     data_science = data.copy()
     data_artifact = hpf_fir(data_science, srate, cfg.artifact_hpf_cutoff)
     if np.isclose(cfg.timing_hpf_cutoff, cfg.artifact_hpf_cutoff):
@@ -466,13 +403,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     # ────────────────────────────────────────────────────────
     banner("REFERENCE CHANNEL", "📡")
 
-    # Restore the reference criterion that produced the stable timing on the
-    # validation run: largest artifact excursion on the HPF branch.  The
-    # repeatability score is still logged as a diagnostic, but it no longer
-    # chooses a different timing minimum by itself.
     peak_abs = np.max(np.abs(data_timing), axis=1)
-    ref_ch = int(np.argmax(peak_abs))
-    _, ref_scores = _select_reference_channel(
+    ref_ch, ref_scores = _select_reference_channel(
         timing_data=data_timing,
         vol_onsets=vol_onsets,
         srate=srate,
@@ -502,6 +434,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             vol_onsets=vol_onsets,
             n_sg=cfg.n_sg,
             n_vol=n_vol,
+            max_gap_seconds=cfg.timing_max_gap_seconds,
+            highpass_cutoff=cfg.timing_reference_hpf,
         )
         initial_sdur_by_channel.append(float(s_i))
         initial_dtime_by_channel.append(float(d_i))
@@ -514,6 +448,19 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     initial_sdur_by_channel = np.asarray(initial_sdur_by_channel, dtype=np.float64)
     initial_dtime_by_channel = np.asarray(initial_dtime_by_channel, dtype=np.float64)
     sdur_init = float(np.median(initial_sdur_by_channel))
+    timing_quality = [{
+        "channel": name,
+        "sdur_mad_seconds": diag["sdur_mad"],
+        "gap_mad_seconds": diag["dtime_mad"],
+        "fraction_at_gap_upper_bound": float(np.mean(diag["at_upper_bound"])),
+    } for name, diag in zip(ch_names, timing_diags)]
+    if cfg.timing_mode != "fixed" and all(
+        q["fraction_at_gap_upper_bound"] > 0.5 for q in timing_quality
+    ):
+        raise ValueError(
+            "Initial timing reaches the gap search bound on all channels; "
+            "increase timing_max_gap_seconds or supply verified fixed timing"
+        )
 
     observed_tr_pre = float(np.median(np.diff(vol_onsets))) / srate
     dtime_init = max(0.0, observed_tr_pre - cfg.n_sg * sdur_init)
@@ -524,9 +471,12 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             channel_spread * 1e3,
         )
 
-    # High-frequency scanner-dominated reference used only by optional LOCAL
-    # refinement. This is the same 250-Hz-HPF signal used by the stable coarse
-    # estimator, not the 30-Hz artifact/template branch.
+    # Use scanner-locked repeatability of the timing band, not the largest
+    # single excursion (which can be a muscle burst or a movement transient).
+    ref_ch, ref_scores = _select_reference_channel(
+        np.asarray([diag["ref_250"] for diag in timing_diags]),
+        vol_onsets, srate, cfg.tr,
+    )
     timing_ref_hf = np.asarray(timing_diags[ref_ch]["ref_250"], dtype=np.float32)
 
     info_table([
@@ -600,7 +550,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     if cfg.timing_mode == "fixed":
         sdur = float(cfg.fixed_sdur_seconds)
-        if cfg.n_sg * sdur >= observed_tr:
+        if cfg.n_sg * sdur > float(np.min(np.diff(vol_onsets))) / srate:
             raise ValueError(
                 "fixed_sdur_seconds is incompatible with measured TR and n_sg"
             )
@@ -644,6 +594,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         )
 
     reconstructed_tr = cfg.n_sg * sdur + dtime
+    if cfg.n_sg * sdur > float(np.min(np.diff(vol_onsets))) / srate + 1.0 / srate:
+        raise ValueError("Acquisition groups overlap a following volume trigger")
     if timing_ref_up is not None:
         del timing_ref_up
 
@@ -711,12 +663,14 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     scan_start_up = 0
     scan_stop_up = data_science_up.shape[1]
 
+    correction_diagnostics = []
     for ch in range(n_ch):
         banner(f"CHANNEL {ch + 1}/{n_ch}: {ch_names[ch]}", "🔧")
 
         t0 = time.time()
 
-        data_science_up[ch] = _correct_channel(
+        channel_stats = {"channel": ch_names[ch]}
+        clean_up = _correct_channel(
             ch_science_signal=data_science_up[ch],
             ch_artifact_signal=data_artifact_up[ch],
             onsets_up=onsets_up,
@@ -730,7 +684,13 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             srate_up=srate_up,
             ch_name=ch_names[ch],
             fig_dir=fig_dir,
+            diagnostics=channel_stats,
         )
+        # Keep only the correction for downsampling. This makes a null
+        # correction an exact identity at the native sampling rate.
+        data_science_up[ch] -= clean_up
+        del clean_up
+        correction_diagnostics.append(channel_stats)
 
         logger.info(
             "Channel %s done in %.2f s",
@@ -749,13 +709,29 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     # No analysis-band HPF/LPF is imposed here: the exported waveform remains
     # the broadband FARM result.  This cleanly separates denoising from later
     # EMG feature/regressor construction.
-    data_clean_crop = downsample(
+    correction_native = downsample(
         data_up=data_science_up,
         srate_up=srate_up,
         factor=cfg.interp_factor,
         target_length=n_samples_orig,
     )
+    data_clean_crop = data_raw_trim - correction_native
+    del correction_native
     del data_science_up, data_artifact_up
+
+    native_onsets = np.rint(onsets_up / cfg.interp_factor).astype(np.int64)
+    native_stops = np.rint(
+        (onsets_up + round_errors) / cfg.interp_factor + sdur * srate
+    ).astype(np.int64)
+    masked_intervals = gap_mask_intervals(
+        native_onsets, slice_info["last_slice_idx"], int(round(sdur * srate)),
+        cfg.zero_fill_gap_fraction, segment_stops=native_stops,
+        scan_stop=n_samples_orig,
+    )
+    for start, stop in masked_intervals:
+        data_clean_crop[:, start:stop] = 0.0
+    if masked_intervals:
+        logger.warning("Explicitly zero-masked %d samples per channel", sum(b-a for a,b in masked_intervals))
 
     # Reconstruct the full recording.  Outside the fMRI scan crop, data are
     # untouched; inside it, only the selected EMG channels are FARM-cleaned.
@@ -793,6 +769,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         vol_onsets=vol_onsets,
         tr=cfg.tr,
         bandpass=None,
+    )
+    harmonic_results = compute_gradient_harmonic_reduction(
+        data_raw_trim, data_clean_crop, srate, ch_names, sdur, cfg.qc_bandpass,
     )
 
     if fig_dir is not None:
@@ -881,14 +860,22 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "dtime_initial_seconds": dtime_init,
         "initial_sdur_by_channel_seconds": initial_sdur_by_channel,
         "initial_dtime_by_channel_seconds": initial_dtime_by_channel,
+        "timing_quality": timing_quality,
         "sdur_seconds": sdur,
         "dtime_seconds": dtime,
         "observed_tr_seconds": observed_tr,
         "reconstructed_tr_seconds": reconstructed_tr,
         "zero_fill_gap_fraction": cfg.zero_fill_gap_fraction,
+        "correct_volume_gaps": cfg.correct_volume_gaps,
+        "correction_diagnostics": correction_diagnostics,
+        "masked_intervals_samples_full": [[a+s_trim, b+s_trim] for a,b in masked_intervals],
+        "masked_fraction_of_scan": sum(b-a for a,b in masked_intervals) / n_samples_orig,
+        "science_time_grid_preserved": True,
+        "software_version": "1.2.0",
         "qc_bandpass_hz": cfg.qc_bandpass,
         "rms_reduction": rms_results,
         "scanner_locked_reduction": scanner_locked_results,
+        "gradient_harmonic_reduction": harmonic_results,
     }
     metadata_path = export_metadata(cfg.output_dir, basename, metadata)
     logger.info("Denoising sidecar: %s", metadata_path)
@@ -936,6 +923,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "raw_original": raw_original,
         "rms_results": rms_results,
         "scanner_locked_results": scanner_locked_results,
+        "harmonic_results": harmonic_results,
+        "correction_diagnostics": correction_diagnostics,
         "figures_dir": fig_dir,
         "output_dir": cfg.output_dir,
         "brainvision_path": brainvision_path,

@@ -4,6 +4,7 @@ import logging
 
 import numpy as np
 from farm.preprocessing.filters import hpf_butter_1d
+from farm.utils.signal import standardize_rows
 
 logger = logging.getLogger("farm.timing.estimation")
 
@@ -15,8 +16,7 @@ def _vol_variance(
     dtime_samp: int,
     n_sg: int,
 ) -> float:
-    """Sum of per-sample standard deviations across slice segments
-    within a single volume, for a given *dtime_samp*."""
+    """Normalized mean deviation across interior groups for one gap candidate."""
     remaining = vol_dur - dtime_samp
     if remaining <= 0 or n_sg < 2:
         return np.inf
@@ -31,7 +31,11 @@ def _vol_variance(
         if start < 0 or stop > len(signal_1d):
             return np.inf
         segs[k] = signal_1d[start:stop]
-    return float(np.sum(np.std(segs, axis=0)))
+    # A sum rewards shorter segments even for unrelated data. Compare equal
+    # units and ignore boundary groups when enough interior groups exist.
+    if n_sg > 3:
+        segs = segs[1:-1]
+    return float(np.mean(np.std(standardize_rows(segs), axis=0)))
 
 
 def estimate_initial_timing(
@@ -40,12 +44,14 @@ def estimate_initial_timing(
     vol_onsets: np.ndarray,
     n_sg: int,
     n_vol: int,
+    *,
+    max_gap_seconds: float = 0.2,
+    highpass_cutoff: float = 250.0,
 ) -> tuple:
     """Estimate initial *sdur* and *dtime* by scanning each volume.
 
-    A 250 Hz high-pass is applied to the reference channel to
-    isolate the high-frequency gradient artifact, following the
-    MATLAB FARM implementation.
+    A configurable high-pass (250 Hz by default) isolates the timing reference.
+    Its band must remain scanner-dominated after acquisition filtering.
 
     Parameters
     ----------
@@ -61,9 +67,17 @@ def estimate_initial_timing(
     dtime_init : float — initial dead-time (s).
     diag : dict — per-volume values for optional plotting.
     """
-    ref_250 = hpf_butter_1d(ref_signal, srate, 250.0)
+    if not (0.0 < highpass_cutoff < srate / 2):
+        raise ValueError("Timing high-pass must be between zero and Nyquist")
+    if n_sg < 2 or n_vol < 2 or len(vol_onsets) < n_vol:
+        raise ValueError("Timing requires at least two groups and two volume onsets")
+    if max_gap_seconds <= 0:
+        raise ValueError("max_gap_seconds must be positive")
+    ref_250 = hpf_butter_1d(ref_signal, srate, highpass_cutoff)
     n_sample_per_tr = int(np.median(np.diff(vol_onsets)))
-    dtime_max = int(round(n_sample_per_tr / n_sg / 2))
+    dtime_max = min(int(round(max_gap_seconds * srate)), n_sample_per_tr - 8 * n_sg)
+    if dtime_max < 0:
+        raise ValueError("TR is too short for the requested number of groups")
     dtime_candidates = np.arange(dtime_max + 1, dtype=np.int64)
 
     sdur_list, dtime_list, sv_list = [], [], []
@@ -82,6 +96,8 @@ def estimate_initial_timing(
             sv = _vol_variance(ref_250, vol_start, vol_dur, int(dt), n_sg)
             if sv < best_sv:
                 best_sv, best_dt = sv, int(dt)
+        if not np.isfinite(best_sv):
+            continue
         sdur_list.append((vol_dur - best_dt) / n_sg / srate)
         dtime_list.append(best_dt / srate)
         sv_list.append(best_sv)
@@ -89,6 +105,8 @@ def estimate_initial_timing(
     # Use robust medians rather than means. A few volumes can contain strong
     # voluntary EMG or transient motion; those volumes must not pull the
     # sequence timing away from the scanner's fixed acquisition pattern.
+    if not sdur_list:
+        raise ValueError("No complete valid volumes for initial timing estimation")
     sdur_arr = np.asarray(sdur_list, dtype=np.float64)
     dtime_arr = np.asarray(dtime_list, dtype=np.float64)
     sdur_init = float(np.median(sdur_arr))
@@ -113,5 +131,8 @@ def estimate_initial_timing(
         "n_sample_per_tr": n_sample_per_tr,
         "sdur_mad": sdur_mad,
         "dtime_mad": dtime_mad,
+        "search_max_gap_seconds": dtime_max / srate,
+        "at_upper_bound": np.asarray(dtime_list) >= dtime_max / srate,
+        "highpass_cutoff_hz": highpass_cutoff,
     }
     return sdur_init, dtime_init, diag

@@ -3,6 +3,37 @@
 import numpy as np
 
 
+def gap_mask_intervals(
+    onsets: np.ndarray,
+    last_slice_idx: np.ndarray,
+    seg_len: int,
+    gap_fraction: float,
+    *,
+    segment_stops: np.ndarray | None = None,
+    scan_stop: int | None = None,
+) -> list[list[int]]:
+    """Return half-open sample intervals explicitly removed by gap masking."""
+    if not 0.0 <= gap_fraction <= 1.0:
+        raise ValueError("gap_fraction must be in [0, 1]")
+    intervals = []
+    if gap_fraction == 0:
+        return intervals
+    for idx in np.asarray(last_slice_idx, dtype=np.int64):
+        if idx < 0 or idx >= len(onsets):
+            continue
+        start = int(segment_stops[idx]) if segment_stops is not None else int(onsets[idx]) + seg_len
+        if idx + 1 < len(onsets):
+            end = int(onsets[idx + 1])
+        elif scan_stop is not None:
+            end = int(scan_stop)
+        else:
+            continue
+        stop = start + int(round(gap_fraction * max(0, end - start)))
+        if stop > start:
+            intervals.append([start, stop])
+    return intervals
+
+
 def zero_fill_dtime(
     signal: np.ndarray,
     onsets_up: np.ndarray,
@@ -10,6 +41,9 @@ def zero_fill_dtime(
     seg_len: int,
     dtime_samp_up: int | None = None,
     gap_fraction: float = 1.0,
+    *,
+    segment_stops: np.ndarray | None = None,
+    scan_stop: int | None = None,
 ) -> np.ndarray:
     """Zero-fill actual inter-volume gaps.
 
@@ -53,28 +87,11 @@ def zero_fill_dtime(
     if gap_fraction == 0.0:
         return out
 
-    for last_idx in last_slice_idx:
-        if last_idx < 0 or last_idx >= len(onsets_up):
-            continue
-
-        next_idx = int(last_idx) + 1
-
-        # There is no known following volume boundary after the final volume.
-        if next_idx >= len(onsets_up):
-            continue
-
-        last_segment_end = int(onsets_up[last_idx]) + int(seg_len)
-        next_volume_start = int(onsets_up[next_idx])
-
-        if next_volume_start <= last_segment_end:
-            continue
-
-        gap_len = next_volume_start - last_segment_end
-        fill_stop = last_segment_end + int(round(gap_fraction * gap_len))
-
-        start = max(0, min(last_segment_end, len(out)))
-        stop = max(0, min(fill_stop, len(out)))
-
+    for start, stop in gap_mask_intervals(
+        onsets_up, last_slice_idx, seg_len, gap_fraction,
+        segment_stops=segment_stops, scan_stop=scan_stop,
+    ):
+        start, stop = max(0, start), min(stop, len(out))
         if stop > start:
             out[start:stop] = 0.0
 

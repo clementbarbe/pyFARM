@@ -29,6 +29,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--n-slices", type=int, required=True, help="Number of anatomical EPI slices")
     p.add_argument("--mb-factor", type=int, default=1, help="Multiband factor")
     p.add_argument("--trigger", default="R128", help="Volume trigger label")
+    p.add_argument("--trigger-tolerance-ms", type=float, default=5.0)
     p.add_argument("--ch-regex", default=r"EXT|FLE", help="Regex selecting EMG channels")
     p.add_argument("--interp-factor", type=int, default=10)
     p.add_argument("--window-size", type=int, default=50, help="Template search window in volumes")
@@ -39,6 +40,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--var-threshold", type=float, default=5.0)
     p.add_argument("--artifact-hpf", type=float, default=30.0)
     p.add_argument("--timing-hpf", type=float, default=30.0)
+    p.add_argument("--timing-reference-hpf", type=float, default=250.0,
+                   help="High-pass for timing only; choose a scanner-dominated band")
+    p.add_argument("--timing-max-gap-ms", type=float, default=200.0,
+                   help="Maximum inter-volume gap in the coarse timing search")
     p.add_argument(
         "--timing-mode", choices=("initial", "local", "fixed"), default="initial",
         help=(
@@ -59,13 +64,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--fixed-sdur-ms", type=float, default=None,
         help="Fixed slice-group duration in ms when --timing-mode fixed",
     )
-    p.add_argument("--template-min-corr", type=float, default=-1.0)
-    p.add_argument("--template-trim", type=float, default=0.0)
-    p.add_argument("--pca-artifact-corr", type=float, default=0.10)
-    p.add_argument("--pca-max-components", type=int, default=6)
+    p.add_argument("--template-min-corr", type=float, default=0.80)
+    p.add_argument("--template-trim", type=float, default=0.10)
+    p.add_argument("--template-scale-bounds", type=float, nargs=2, default=(0.0, 2.0))
+    p.add_argument("--no-gap-correction", action="store_true",
+                   help="Disable non-destructive templates for inter-volume gaps")
+    p.add_argument("--pca-artifact-corr", type=float, default=0.60)
+    p.add_argument("--pca-max-components", type=int, default=4,
+                   help="Maximum artifact-supported residual components; 0 disables PCA")
     p.add_argument(
         "--zero-fill-gap-fraction", type=float, default=0.0,
-        help="Fraction of true inter-volume gap masked (validated dataset: 1.0)",
+        help="Explicit destructive gap masking; default 0 preserves measured EMG",
     )
     p.add_argument("--qc-band", type=float, nargs=2, metavar=("LOW", "HIGH"), default=(30.0, 250.0))
     p.add_argument("--no-figures", action="store_true")
@@ -80,6 +89,7 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         n_slices=args.n_slices,
         mb_factor=args.mb_factor,
         trigger=args.trigger,
+        trigger_tolerance_seconds=args.trigger_tolerance_ms / 1000.0,
         ch_regex=args.ch_regex,
         interp_factor=args.interp_factor,
         window_size=args.window_size,
@@ -90,12 +100,16 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         var_threshold=args.var_threshold,
         artifact_hpf_cutoff=args.artifact_hpf,
         timing_hpf_cutoff=args.timing_hpf,
+        timing_reference_hpf=args.timing_reference_hpf,
+        timing_max_gap_seconds=args.timing_max_gap_ms / 1000.0,
         timing_mode=args.timing_mode,
         timing_refine_half_width_seconds=args.timing_refine_half_width_ms / 1000.0,
         timing_min_relative_improvement=args.timing_min_relative_improvement,
         fixed_sdur_seconds=(None if args.fixed_sdur_ms is None else args.fixed_sdur_ms / 1000.0),
         template_min_correlation=args.template_min_corr,
         template_trim_fraction=args.template_trim,
+        template_scale_bounds=tuple(args.template_scale_bounds),
+        correct_volume_gaps=not args.no_gap_correction,
         pca_artifact_corr_threshold=args.pca_artifact_corr,
         pca_max_components=args.pca_max_components,
         zero_fill_gap_fraction=args.zero_fill_gap_fraction,

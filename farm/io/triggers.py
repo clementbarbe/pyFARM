@@ -14,6 +14,7 @@ def detect_volume_onsets(
     tr: float,
     n_volumes: int | None = None,
     drop_last: bool = False,
+    max_interval_error_seconds: float = 0.005,
 ) -> tuple:
     """Extract volume-onset sample indices from annotations.
 
@@ -36,18 +37,24 @@ def detect_volume_onsets(
     events, event_dict = mne.events_from_annotations(raw, verbose=False)
     logger.debug("Event types found: %s", event_dict)
 
-    target_id = None
-    for key, val in event_dict.items():
-        if trigger in key:
-            target_id = val
-            break
-    if target_id is None:
+    def marker_label(text):
+        return "".join(text.rsplit("/", 1)[-1].split()).casefold()
+
+    matches = [val for key, val in event_dict.items()
+               if key.strip().casefold() == trigger.strip().casefold()]
+    if not matches:
+        matches = [val for key, val in event_dict.items()
+                   if marker_label(key) == marker_label(trigger)]
+    if not matches:
         raise ValueError(
             f"Trigger '{trigger}' not found. Available: {list(event_dict.keys())}"
         )
+    if len(matches) != 1:
+        raise ValueError(f"Ambiguous trigger '{trigger}': multiple event types match")
+    target_id = matches[0]
 
     srate = float(raw.info["sfreq"])
-    vol_onsets = events[events[:, 2] == target_id, 0].astype(np.int64)
+    vol_onsets = events[events[:, 2] == target_id, 0].astype(np.int64) - raw.first_samp
 
     if n_volumes is not None:
         vol_onsets = vol_onsets[:n_volumes]
@@ -71,6 +78,13 @@ def detect_volume_onsets(
 
     # ── IVI statistics ───────────────────────────────────────
     ivis = np.diff(vol_onsets) / srate
+    tolerance = max(float(max_interval_error_seconds), 2.0 / srate)
+    if np.any(ivis <= 0) or np.any(np.abs(ivis - tr) > tolerance):
+        raise ValueError(
+            f"Irregular volume triggers: interval range {ivis.min():.6f}–{ivis.max():.6f} s, "
+            f"expected TR={tr:.6f} s +/-{tolerance:.6f} s. "
+            "Check missing/duplicate triggers, acquisition pauses, and configured TR."
+        )
     ivi_stats = {
         "mean": float(np.mean(ivis)),
         "std": float(np.std(ivis)),

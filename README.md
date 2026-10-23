@@ -5,10 +5,25 @@ acquisition artifacts and exports a cleaned BrainVision recording.  It does
 **not** compute envelopes, normalize EMG amplitudes, convolve with an HRF, or
 create SPM regressors.
 
-The scientific core retains the validated FARM-like workflow used on the
-supplied dataset: trigger-anchored slice-group timing, fractional alignment,
-adaptive templates, true inter-volume gap masking when explicitly enabled,
-and artifact-gated global PCA residual cleanup.
+The FARM-inspired core uses trigger-anchored timing, fractional alignment of
+artifact estimates, robust same-group templates, dedicated volume-gap
+templates, and artifact-supported PCA. Corrections are returned to the original
+time grid and subtracted from the native measurement. The scientific changes
+in v1.2 require validation for each acquisition protocol.
+
+Original article :
+  Van der Meer, J. N., Tijssen, M. A. J., Bour, L. J., van Rootselaar, A. F., & Nederveen, A. J. (2010).
+  **Robust EMG–fMRI artifact reduction for motion (FARM)**.
+  Clinical Neurophysiology, 121(5), 766–776.
+  https://doi.org/10.1016/j.clinph.2009.12.035
+
+GitHub page of the first author :
+
+  https://github.com/jnvandermeer
+
+GitHub page of the MATLAB version :
+
+  https://github.com/benoitberanger/FARM
 
 ## Install
 
@@ -19,12 +34,11 @@ python -m pip install -e .
 ## One run
 
 ```bash
-pyfarm-denoise run C4X001/C4X001_R1.vhdr \
+pyfarm-denoise data/me3mb3_tr1600_sl54.vhdr \
   --output-dir denoised/C4X001 \
   --tr 1.6 --n-slices 54 --mb-factor 3 \
   --trigger R128 --ch-regex 'EXT|FLE' \
-  --drop-last-volume \
-  --zero-fill-gap-fraction 1.0
+  --drop-last-volume
 ```
 
 The exported `*_FARM.vhdr/.eeg/.vmrk` signal is the **broadband FARM-cleaned
@@ -45,7 +59,6 @@ pyfarm-denoise batch raw denoised \
   --tr 1.6 --n-slices 54 --mb-factor 3 \
   --trigger R128 --ch-regex 'EXT|FLE' \
   --drop-last-volume \
-  --zero-fill-gap-fraction 1.0 \
   --skip-existing
 ```
 
@@ -91,20 +104,55 @@ Three modes are available:
 
 ```bash
 pyfarm-denoise batch raw denoised ... \
-  --timing-mode fixed --fixed-sdur-ms 81.9955
+  --timing-mode fixed --fixed-sdur-ms <verified_protocol_sdur_ms>
 ```
 
 Use `fixed` only after establishing the protocol timing from representative
 runs or sequence documentation. The sidecar records both the initial and final
 timing so cohort-level QC is straightforward.
 
-## Important protocol-specific setting
+## Signal preservation (v1.2)
 
-`zero_fill_gap_fraction=0` is the generic safety default because masking a gap
-can destroy real EMG.  On the supplied 1.6-s TR / 54-slice / MB3 acquisition,
-validation showed a strong scanner-locked boundary artifact in the true
-dead-time, and `1.0` produced the cleaner spectrum.  Keep this choice explicit
-in analysis scripts.
+Fractional shifts are applied to padded artifact estimates and inverted before
+subtraction. Only the estimated correction is downsampled; the original native
+science samples are retained. A zero correction therefore preserves them exactly.
+
+Templates require both target similarity and agreement between two disjoint
+averages of selected candidates (default correlation 0.8). A 10% trimmed mean and
+scale bounds [0, 2] limit transient contamination and extreme scaling. Templates
+for the inter-volume gap are fitted separately; `--no-gap-correction` disables
+this step. These safeguards cannot distinguish true EMG that exactly repeats
+with the scanner from an artifact of the same shape.
+
+PCA defaults to at most four components with artifact correlation >=0.6. Only
+the artifact-supported projection is subtracted, with correction strength
+increasing continuously with artifact similarity. `--pca-max-components 0`
+disables all residual PCA cleanup, including the section mean.
+
+`--zero-fill-gap-fraction` defaults to **0**. Nonzero values destroy measured
+samples and are applied only after downsampling. The sidecar records their
+exact half-open sample intervals and the fraction of the scan removed. Prefer
+gap-template correction when preservation matters; a cleaner spectrum alone
+does not justify masking physiological activity.
+
+The coarse timing search covers gaps up to 200 ms by default
+(`--timing-max-gap-ms`). Set this bound from sequence information. Local
+refinement stays within the configured neighbourhood. Missing/duplicate triggers
+or unexpected intervals stop processing; `--trigger-tolerance-ms` defaults to
+5 ms. The timing-only high-pass is configurable via `--timing-reference-hpf`
+(default 250 Hz); verify scanner dominance after acquisition filtering.
+
+QC includes global RMS, trigger-locked RMS and excess spectral power near
+slice-group harmonics. None proves physiological preservation. Use independent
+EMG injections, inspect bursts and compare with PCA disabled. The sidecar also
+records applied template counts, correction RMS and timing dispersion.
+
+Broadband export means no final analysis-band filter is imposed. It does not
+restore frequencies removed by acquisition hardware, and low-frequency motion
+artifacts outside the template-estimation band may remain.
+
+See [TESTING.md](TESTING.md) for injection results, the PCA ablation and the
+reproducible validation command.
 
 ## Output philosophy
 

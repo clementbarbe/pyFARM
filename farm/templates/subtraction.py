@@ -34,16 +34,16 @@ def build_artifact_templates(
     dtime_samp_up: int,
     seg_len: int,
     *,
-    trim_fraction: float = 0.0,
-    min_correlation: float = -1.0,
-    scale_bounds: tuple[float, float] | None = None,
+    trim_fraction: float = 0.1,
+    min_correlation: float = 0.8,
+    scale_bounds: tuple[float, float] | None = (0.0, 2.0),
+    padding: int = 0,
 ) -> np.ndarray:
     """Build one artifact template per valid acquisition-group occurrence.
 
-    Defaults reproduce the legacy FARM selection as closely as possible while
-    keeping the corrected full correlation window for the last group.
-    Optional robust trimming/correlation gating can still be enabled from the
-    configuration for difficult datasets.
+    Padded context is averaged too, so estimates can subsequently be shifted
+    back onto the original time grid without wrapping a cropped template.
+    Correlation/scaling use only the acquisition interval, excluding context.
     """
     del dtime_samp_up  # dead time lies after the final group, not inside it
 
@@ -58,7 +58,8 @@ def build_artifact_templates(
 
     row_of_slice = {int(s): row for row, s in enumerate(valid_idx)}
     artifact_segments = np.zeros_like(aligned_segments)
-    window = slice(0, int(seg_len))
+    half = int(padding // 2)
+    window = slice(half, half + int(seg_len))
 
     for row, slice_idx in enumerate(valid_idx):
         candidates = np.asarray(slice_info["candidate_idx"][slice_idx], dtype=np.int64)
@@ -86,6 +87,14 @@ def build_artifact_templates(
         template = _trimmed_mean_rows(
             aligned_segments[selected_rows], trim_fraction=float(trim_fraction)
         )
+
+        # Two disjoint averages must agree. High target correlations alone
+        # can select accidental matches in physiological/background activity.
+        a = aligned_segments[selected_rows[::2], window].mean(axis=0)
+        b = aligned_segments[selected_rows[1::2], window].mean(axis=0)
+        repeatability = float(corr_with_matrix(a, b[None, :])[0])
+        if repeatability < max(0.0, float(min_correlation)):
+            continue
 
         denominator = float(np.dot(template[window], template[window]))
         if denominator < 1e-20:

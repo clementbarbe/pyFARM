@@ -9,5 +9,4 @@ pyfarm-denoise batch /path/to/raw /path/to/denoised \
   --trigger R128 \
   --ch-regex 'EXT|FLE' \
   --drop-last-volume \
-  --zero-fill-gap-fraction 1.0 \
   --skip-existing

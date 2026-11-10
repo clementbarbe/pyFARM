@@ -11,4 +11,5 @@ output/
 denoised/
 figures/
 data/
+input/
 .DS_Store

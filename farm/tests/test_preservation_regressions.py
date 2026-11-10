@@ -233,7 +233,8 @@ def test_brainvision_marker_rounding_preserves_single_samples(tmp_path, first_sa
 
 
 @pytest.mark.parametrize("mask_fraction", [0.0, 1.0])
-def test_full_pipeline_identity_and_explicit_mask(tmp_path, monkeypatch, mask_fraction):
+@pytest.mark.parametrize("science_mode", ["broadband", "matched"])
+def test_full_pipeline_identity_and_explicit_mask(tmp_path, monkeypatch, mask_fraction, science_mode):
     emg, _, fs, volumes, cfg = synthetic_emg(n_vol=6)
     prefix, suffix = 73, 150
     full = np.r_[np.ones(prefix)*2e-6, emg*1e-5, np.ones(suffix)*3e-6]
@@ -243,13 +244,17 @@ def test_full_pipeline_identity_and_explicit_mask(tmp_path, monkeypatch, mask_fr
     monkeypatch.setattr("farm.workflow._estimate_interval_artifact",
                         lambda reference, *args: np.zeros_like(reference))
     cfg.vhdr_path = input_path
+    cfg.science_mode = science_mode
     cfg.output_dir = str(tmp_path / "output")
     cfg.zero_fill_gap_fraction = mask_fraction
     result = run_pipeline(cfg)
     metadata = json.loads(open(result["metadata_path"]).read())
     expected = result["data_full_raw"].copy()
+    if science_mode == "matched":
+        expected[:, prefix:prefix+len(emg)] = hpf_fir(result["data_raw_trim"], fs, cfg.artifact_hpf_cutoff)
     for start, stop in metadata["masked_intervals_samples_full"]:
         expected[:, start:stop] = 0
     np.testing.assert_array_equal(result["data_clean_full"], expected)
     assert bool(metadata["masked_intervals_samples_full"]) == bool(mask_fraction)
     assert metadata["scan_start_sample"] == prefix
+    assert metadata["output_is_broadband_farm"] == (science_mode == "broadband")

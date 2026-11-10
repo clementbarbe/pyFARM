@@ -9,6 +9,33 @@ from farm.utils.signal import standardize_rows
 logger = logging.getLogger("farm.timing.estimation")
 
 
+def timing_consensus(estimates, locked_scores, srate, n_sg):
+    """Exclude a weak timing reference when channels disagree substantially.
+
+    A median of two channels is their arithmetic midpoint and is not robust
+    to one dead/noisy channel. Small, quantization-sized differences retain the
+    existing median. Larger disagreements require scanner-repeatability evidence;
+    an unresolved disagreement is returned explicitly for the caller to handle.
+    """
+    estimates = np.asarray(estimates, dtype=float)
+    scores = np.asarray(locked_scores, dtype=float)
+    if estimates.shape != scores.shape or estimates.ndim != 1 or not len(estimates):
+        raise ValueError("Timing estimates and scores must be matching non-empty vectors")
+    if not np.all(np.isfinite(estimates)) or not np.all(np.isfinite(scores)):
+        raise ValueError("Timing estimates and scores must be finite")
+    tolerance = 5.0/(srate*n_sg)
+    selected = np.ones(len(estimates), dtype=bool)
+    if np.ptp(estimates) > tolerance and np.max(scores) > 0:
+        selected = scores >= .1*np.max(scores)
+    disagreement = float(np.ptp(estimates[selected]))
+    return float(np.median(estimates[selected])), {
+        "locked_scores": scores.tolist(), "channels_used": np.flatnonzero(selected).tolist(),
+        "disagreement_tolerance_seconds": tolerance,
+        "selected_spread_seconds": disagreement,
+        "unresolved_disagreement": bool(disagreement > tolerance),
+    }
+
+
 def _vol_variance(
     signal_1d: np.ndarray,
     vol_start: int,

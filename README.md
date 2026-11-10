@@ -1,29 +1,12 @@
 # pyFARM-denoise
 
-`pyFARM-denoise` is a **denoising-only** EMG-fMRI pipeline.  It removes MRI
-acquisition artifacts and exports a cleaned BrainVision recording.  It does
-**not** compute envelopes, normalize EMG amplitudes, convolve with an HRF, or
-create SPM regressors.
+Python pipeline for reducing MRI gradient artifacts in EMG recordings acquired
+simultaneously with fMRI. It exports BrainVision signals and quantitative QC.
+Envelope extraction, normalization, HRF convolution and SPM regressors belong to
+a separate analysis step.
 
-The FARM-inspired core uses trigger-anchored timing, fractional alignment of
-artifact estimates, robust same-group templates, dedicated volume-gap
-templates, and artifact-supported PCA. Corrections are returned to the original
-time grid and subtracted from the native measurement. The scientific changes
-in v1.2 require validation for each acquisition protocol.
-
-Original article :
-  Van der Meer, J. N., Tijssen, M. A. J., Bour, L. J., van Rootselaar, A. F., & Nederveen, A. J. (2010).
-  **Robust EMG–fMRI artifact reduction for motion (FARM)**.
-  Clinical Neurophysiology, 121(5), 766–776.
-  https://doi.org/10.1016/j.clinph.2009.12.035
-
-GitHub page of the first author :
-
-  https://github.com/jnvandermeer
-
-GitHub page of the MATLAB version :
-
-  https://github.com/benoitberanger/FARM
+The method is inspired by [van der Meer et al. (2010), FARM](https://doi.org/10.1016/j.clinph.2009.12.035).
+This implementation differs from the original algorithm; see [METHOD.md](METHOD.md).
 
 ## Install
 
@@ -31,132 +14,151 @@ GitHub page of the MATLAB version :
 python -m pip install -e .
 ```
 
-## One run
+## Process a run
 
 ```bash
-pyfarm-denoise data/me3mb3_tr1600_sl54.vhdr \
-  --output-dir denoised/C4X001 \
-  --tr 1.6 --n-slices 54 --mb-factor 3 \
-  --trigger R128 --ch-regex 'EXT|FLE' \
-  --drop-last-volume
+pyfarm-denoise run input/participant-01/run-01.vhdr \
+  --output-dir output/run-01 \
+  --tr 1.660 --n-slices 60 --mb-factor 3 \
+  --trigger R128 --ch-regex 'ZYG|COR' \
+  --drop-last-volume --science-mode matched --timing-mode initial
 ```
 
-The exported `*_FARM.vhdr/.eeg/.vmrk` signal is the **broadband FARM-cleaned
-waveform**.  The 30–250 Hz band is used only for QC figures/metrics and is not
-imposed on the exported data.
+TR is in seconds. `n-slices` is the anatomical slice count; 60 slices with MB3
+means 20 acquisition groups per volume. Change these values for other sequences.
+Use `--drop-last-volume` when the final trigger precedes an incomplete/manual-stop
+volume. The `.vhdr`, `.eeg` and `.vmrk` files must be present together.
 
-A `*_FARM_denoise.json` sidecar records the retained volume onsets, scan crop,
-timing estimates, channels, and QC metrics.  The separate `emg-regressors`
-tool uses this sidecar when available.
-
-## Whole dataset
-
-For a tree such as `raw/C4X001/C4X001_R1.vhdr`, etc.:
+## Process a dataset
 
 ```bash
-pyfarm-denoise batch raw denoised \
+pyfarm-denoise batch input output/denoised \
   --pattern '*.vhdr' \
-  --tr 1.6 --n-slices 54 --mb-factor 3 \
-  --trigger R128 --ch-regex 'EXT|FLE' \
-  --drop-last-volume \
-  --skip-existing
+  --tr 1.660 --n-slices 60 --mb-factor 3 \
+  --trigger R128 --ch-regex 'ZYG|COR' \
+  --drop-last-volume --science-mode matched --timing-mode initial \
+  --zero-fill-gap-fraction 0 --line-cleanup off
 ```
 
-Output is kept flat within each subject directory:
+Subject subdirectories are retained. Each run receives its own figure directory.
+`example_batch.sh` provides a logged batch command. For a deliberate restart,
+`--skip-existing` skips any existing output header; it does **not** verify that
+the old output used the same configuration. Prefer a new output directory when
+comparing versions or settings.
 
-```text
-denoised/
-└── C4X001/
-    ├── C4X001_R1_FARM.vhdr
-    ├── C4X001_R1_FARM.eeg
-    ├── C4X001_R1_FARM.vmrk
-    ├── C4X001_R1_FARM_denoise.json
-    ├── C4X001_R2_FARM.vhdr
-    └── ...
-```
+## Output and defaults
 
-Figures are written under `figures/<run_basename>/` so batch runs cannot
-overwrite one another.
+- `*_FARM.vhdr/.eeg/.vmrk`: full-length recording, with selected channels corrected
+  inside the retained scan crop. Sample positions and timing remain native.
+- `*_FARM_denoise.json`: configuration, volume onsets, timing estimates, ADC-limit
+  observations, correction diagnostics and quantitative QC.
+- `figures/<run>/`: time plots, spectra, spectrograms and trigger-aligned views.
+  `--no-figures` disables their generation.
 
-## Timing stability (v1.1)
+The default `matched` science branch uses the **same 30-Hz high-pass** as the
+artifact templates. No final 250-Hz low-pass, envelope or amplitude normalization
+is imposed on the exported signal. The 30–250 Hz QC band is applied identically
+to before/after diagnostic signals only. `--science-mode broadband` retains the
+legacy unmatched subtraction for comparisons and can leave large residuals.
 
-`sdur` is a property of the EPI acquisition sequence. It must not jump by
-tens of milliseconds merely because the subject or EMG run changed. Earlier
-versions allowed a broad numerical timing search; because the FARM alignment
-objective is periodic, that search could converge to harmonic/sub-harmonic
-minima while still reporting `success=True`.
+Timing defaults to the robust initial estimate. `local` performs a bounded
+refinement and `fixed` requires `--fixed-sdur-ms` established independently for
+the acquisition protocol. Unexpected trigger intervals stop processing.
 
-The default is now:
+Fractional shifts affect padded artifact estimates; corrections are returned to
+the original grid. Templates use neighboring occurrences of the same acquisition
+group, trimmed averages and repeatability gates. PCA removes only the part
+supported by the estimated artifact subspace. `--pca-max-components 0` disables
+this additional PCA step. Volume-gap templates are enabled; destructive zero
+filling is disabled. Nonzero `--zero-fill-gap-fraction` explicitly destroys
+samples and records their exact intervals.
 
-```text
---timing-mode initial
-```
+## Optional residual-line processing
 
-Timing is estimated independently on every selected EMG channel, robustly
-combined across channels, and `dtime` is derived from the measured TR. No
-broad global optimisation is performed.
-
-Three modes are available:
-
-- `initial` (recommended/default): robust run estimate; safest for fixed EPI protocols.
-- `local`: optional high-frequency refinement restricted to +/-0.5 ms by default.
-- `fixed`: use exactly the same protocol timing for every run. Example:
+Residual peaks are not automatically removed. The default is `--line-cleanup off`.
 
 ```bash
-pyfarm-denoise batch raw denoised ... \
-  --timing-mode fixed --fixed-sdur-ms <verified_protocol_sdur_ms>
+# Report persistent narrow lines without changing samples:
+pyfarm-denoise run input/participant-01/run-01.vhdr \
+  --output-dir output/detection --tr 1.660 --n-slices 60 --mb-factor 3 \
+  --ch-regex 'ZYG|COR' --line-cleanup detect
+
+# Explicit experimental local sinusoidal regression:
+pyfarm-denoise run input/participant-01/run-01.vhdr \
+  --output-dir output/regression --tr 1.660 --n-slices 60 --mb-factor 3 \
+  --ch-regex 'ZYG|COR' --line-cleanup regress --line-max-count 32
 ```
 
-Use `fixed` only after establishing the protocol timing from representative
-runs or sequence documentation. The sidecar records both the initial and final
-timing so cohort-level QC is straightforward.
+`notch` is also available for explicit comparisons. Detection uses neighboring
+spectral amplitudes, persistence, peak width and evidence in the original signal.
+For regression, supported narrow lines are fitted with sine/cosine functions in
+overlapping 32-s Hann windows. Amplitude and phase can vary between windows.
+`--line-regression-window-seconds` changes this duration (minimum 16 s).
+A common-channel harmonic family with volume-spaced sidebands may support lines
+outside the exact scanner/mains grid. Frequencies are detected from data; no
+cohort-specific frequencies are hard-coded.
 
-## Signal preservation (v1.2)
+This stage acts on the waveform, not just the figure. It can also attenuate true
+EMG near a selected frequency, especially narrow coherent activity or cross-talk
+between channels. Common-channel coherence is evidence, **not proof of artifact
+origin**. A more attractive FFT does not establish better physiological recovery.
+Use explicit comparisons and independent injections before adopting this stage.
 
-Fractional shifts are applied to padded artifact estimates and inverted before
-subtraction. Only the estimated correction is downsampled; the original native
-science samples are retained. A zero correction therefore preserves them exactly.
+For paired outputs, generate FFT overlays on identical axes and a CSV report:
 
-Templates require both target similarity and agreement between two disjoint
-averages of selected candidates (default correlation 0.8). A 10% trimmed mean and
-scale bounds [0, 2] limit transient contamination and extreme scaling. Templates
-for the inter-volume gap are fitted separately; `--no-gap-correction` disables
-this step. These safeguards cannot distinguish true EMG that exactly repeats
-with the scanner from an artifact of the same shape.
+```bash
+python scripts/compare_line_outputs.py output/line_comparison \
+  --output-dir output/comparison --validation-dir output/injection_controls
+```
 
-PCA defaults to at most four components with artifact correlation >=0.6. Only
-the artifact-supported projection is subtracted, with correction strength
-increasing continuously with artifact similarity. `--pca-max-components 0`
-disables all residual PCA cleanup, including the section mean.
+The optional validation directory contains JSON files from `validate_preservation.py`.
 
-`--zero-fill-gap-fraction` defaults to **0**. Nonzero values destroy measured
-samples and are applied only after downsampling. The sidecar records their
-exact half-open sample intervals and the fraction of the scan removed. Prefer
-gap-template correction when preservation matters; a cleaner spectrum alone
-does not justify masking physiological activity.
+An existing FARM output can be evaluated without rerunning the core:
 
-The coarse timing search covers gaps up to 200 ms by default
-(`--timing-max-gap-ms`). Set this bound from sequence information. Local
-refinement stays within the configured neighbourhood. Missing/duplicate triggers
-or unexpected intervals stop processing; `--trigger-tolerance-ms` defaults to
-5 ms. The timing-only high-pass is configurable via `--timing-reference-hpf`
-(default 250 Hz); verify scanner dominance after acquisition filtering.
+```bash
+python scripts/evaluate_lines.py output/denoised/participant-01/run-01_FARM.vhdr \
+  --output-dir output/line_comparison --mode regress --max-lines 32
+```
 
-QC includes global RMS, trigger-locked RMS and excess spectral power near
-slice-group harmonics. None proves physiological preservation. Use independent
-EMG injections, inspect bursts and compare with PCA disabled. The sidecar also
-records applied template counts, correction RMS and timing dispersion.
+It writes a distinct BrainVision output, selection report, PSD and FFT figures.
+The default evaluator mode is detection only. The source sidecar and original
+recording are required. Do not apply the stage repeatedly to an already filtered
+output.
 
-Broadband export means no final analysis-band filter is imposed. It does not
-restore frequencies removed by acquisition hardware, and low-frequency motion
-artifacts outside the template-estimation band may remain.
+## QC and validation
 
-See [TESTING.md](TESTING.md) for injection results, the PCA ablation and the
-reproducible validation command.
+```bash
+python scripts/qc_before_after.py output/denoised --output-dir output/qc
+```
 
-## Output philosophy
+The report compares identical native sample intervals and analysis bands. It
+includes duration, min/max, RMS, scanner-locked residuals, a clearly labeled
+asynchronous/scanner **SNR proxy**, and ADC-limit observations. This proxy is not
+a physiological SNR. No automated metric certifies signal preservation.
 
-Denoising and physiological modelling are deliberately independent.  This
-repository produces the cleaned measurement.  Cross-run amplitude calibration,
-EMG envelopes, HRF convolution, and SPM matrices are handled downstream by the
-separate `emg-regressors` repository.
+INT16 source limits are checked using calibrated amplitudes, including symmetric
+±32767 limits. Other formats are marked unassessed. Clipped input samples cannot
+be reconstructed by denoising; a single rail hit does not justify rejecting an
+entire run without temporal inspection.
+
+Independent physiological injection test (verified fixed protocol timing):
+
+```bash
+python scripts/validate_preservation.py input/participant-01/run-01.vhdr \
+  --tr 1.660 --n-slices 60 --mb-factor 3 --sdur-ms 82 \
+  --ch-regex 'ZYG|COR' --science-mode matched \
+  --line-cleanup regress --line-max-count 32 --output output/injection.json
+```
+
+The test compares `D(raw + independent EMG) - D(raw)` with the injected signal,
+with adaptive and fixed line plans reported separately. These tests do not
+validate all native activity, scanner-synchronous physiology, or frequencies
+below the science high-pass.
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest -q
+```
+
+`input/`, `output/`, `denoised/` and generated figures are ignored by Git. Keep
+participant data and local reports outside the published source tree/index.

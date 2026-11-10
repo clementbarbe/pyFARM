@@ -39,6 +39,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--time-section", type=float, default=60.0)
     p.add_argument("--var-threshold", type=float, default=5.0)
     p.add_argument("--artifact-hpf", type=float, default=30.0)
+    p.add_argument("--science-mode", choices=("matched", "broadband"), default="matched",
+                   help="Match science/template filtering (default); broadband is legacy output")
     p.add_argument("--timing-hpf", type=float, default=30.0)
     p.add_argument("--timing-reference-hpf", type=float, default=250.0,
                    help="High-pass for timing only; choose a scanner-dominated band")
@@ -77,6 +79,15 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         help="Explicit destructive gap masking; default 0 preserves measured EMG",
     )
     p.add_argument("--qc-band", type=float, nargs=2, metavar=("LOW", "HIGH"), default=(30.0, 250.0))
+    p.add_argument("--line-cleanup", choices=("off", "detect", "notch", "regress"), default="off",
+                   help="Optional residual lines: off, detection only, or narrow notches")
+    p.add_argument("--line-band", type=float, nargs=2, default=(30.0, 250.0), metavar=("LOW", "HIGH"))
+    p.add_argument("--line-min-prominence-db", type=float, default=8.0)
+    p.add_argument("--line-max-width-hz", type=float, default=0.5)
+    p.add_argument("--line-min-persistence", type=float, default=0.75)
+    p.add_argument("--line-max-count", type=int, default=12)
+    p.add_argument("--line-window-seconds", type=float, default=8.0)
+    p.add_argument("--line-regression-window-seconds", type=float, default=32.0)
     p.add_argument("--no-figures", action="store_true")
     p.add_argument("--figures-dir", default=None)
     p.add_argument("--suffix", default="_FARM", help="Output basename suffix")
@@ -99,6 +110,7 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         time_section=args.time_section,
         var_threshold=args.var_threshold,
         artifact_hpf_cutoff=args.artifact_hpf,
+        science_mode=args.science_mode,
         timing_hpf_cutoff=args.timing_hpf,
         timing_reference_hpf=args.timing_reference_hpf,
         timing_max_gap_seconds=args.timing_max_gap_ms / 1000.0,
@@ -114,6 +126,14 @@ def _make_config(vhdr: Path, output_dir: Path, args) -> FARMConfig:
         pca_max_components=args.pca_max_components,
         zero_fill_gap_fraction=args.zero_fill_gap_fraction,
         qc_bandpass=tuple(args.qc_band),
+        line_cleanup=args.line_cleanup,
+        line_band=tuple(args.line_band),
+        line_min_prominence_db=args.line_min_prominence_db,
+        line_max_width_hz=args.line_max_width_hz,
+        line_min_persistence=args.line_min_persistence,
+        line_max_count=args.line_max_count,
+        line_window_seconds=args.line_window_seconds,
+        line_regression_window_seconds=args.line_regression_window_seconds,
         output_dir=str(output_dir),
         figures_dir="" if args.no_figures else args.figures_dir,
         output_suffix=args.suffix,

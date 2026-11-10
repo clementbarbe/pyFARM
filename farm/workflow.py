@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from farm.config import FARMConfig
+from farm import __version__
 from farm.utils.display import banner, ok, info_table
 from farm.utils.slices import build_slice_info
 
@@ -27,9 +28,10 @@ from farm.io.triggers import detect_volume_onsets
 from farm.preprocessing.filters import hpf_fir, apply_bandpass
 from farm.preprocessing.resampling import upsample, downsample
 from farm.preprocessing.trim import trim_to_scan
+from farm.preprocessing.lines import clean_spectral_lines, line_cleanup_options
 
 # ── Timing ───────────────────────────────────────────────────
-from farm.timing.estimation import estimate_initial_timing
+from farm.timing.estimation import estimate_initial_timing, timing_consensus
 from farm.timing.optimization import (
     optimize_global_timing,
     compute_slice_markers,
@@ -46,6 +48,7 @@ from farm.pca.cleanup import pca_cleanup
 
 # ── Diagnostics ──────────────────────────────────────────────
 from farm.diagnostics.segments import diagnose_segments
+from farm.diagnostics.acquisition import assess_adc_rails
 from farm.diagnostics.metrics import (
     compute_rms_reduction,
     compute_scanner_locked_reduction,
@@ -343,6 +346,15 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     data_raw_trim = data.copy()
     n_samples_orig = data.shape[1]
+    acquisition_qc = assess_adc_rails(
+        data_raw_trim, srate, [raw.info["chs"][i] for i in ch_indices],
+        ch_names, vol_onsets, cfg.vhdr_path,
+    )
+    for channel_qc in acquisition_qc:
+        if channel_qc.get("rail_samples", 0):
+            logger.warning("%s: %.3f%% of input samples at ADC rails; requires review, "
+                           "denoising cannot recover the pre-clipping signal",
+                           channel_qc["channel"], 100*channel_qc["rail_fraction"])
 
     # Onsets are now relative to the cropped data array.
     # These are the correct real times to sample the fMRI regressors.
@@ -370,14 +382,16 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     t0 = time.time()
 
-    # Only the estimated correction will be resampled back. Native science
-    # samples stay intact and are not forced into a downstream analysis band.
-    data_science = data.copy()
-    data_artifact = hpf_fir(data_science, srate, cfg.artifact_hpf_cutoff)
+    # Identical filtering is essential for subtraction: raw - H(artifact)
+    # leaves a systematic (I-H)(artifact) residual. Keep legacy raw science
+    # available only as an explicit comparison, not the default EMG export.
+    data_artifact = hpf_fir(data, srate, cfg.artifact_hpf_cutoff)
+    data_science = data_artifact.copy() if cfg.science_mode == "matched" else data.copy()
+    data_native_science = data_science.copy()
     if np.isclose(cfg.timing_hpf_cutoff, cfg.artifact_hpf_cutoff):
         data_timing = data_artifact
     else:
-        data_timing = hpf_fir(data_science, srate, cfg.timing_hpf_cutoff)
+        data_timing = hpf_fir(data, srate, cfg.timing_hpf_cutoff)
     data_hpf = data_artifact.copy()
 
     logger.info(
@@ -394,7 +408,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
             srate,
             ch_names[0],
             fig_dir,
-            "Science branch (unfiltered)",
+            f"Science branch ({cfg.science_mode})",
             f"Artifact branch HPF {cfg.artifact_hpf_cutoff:g} Hz",
         )
 
@@ -447,7 +461,18 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     initial_sdur_by_channel = np.asarray(initial_sdur_by_channel, dtype=np.float64)
     initial_dtime_by_channel = np.asarray(initial_dtime_by_channel, dtype=np.float64)
-    sdur_init = float(np.median(initial_sdur_by_channel))
+    ref_ch, ref_scores = _select_reference_channel(
+        np.asarray([diag["ref_250"] for diag in timing_diags]),
+        vol_onsets, srate, cfg.tr,
+    )
+    sdur_init, consensus_quality = timing_consensus(
+        initial_sdur_by_channel, ref_scores, srate, cfg.n_sg,
+    )
+    if consensus_quality["unresolved_disagreement"] and cfg.timing_mode != "fixed":
+        raise ValueError("Reliable timing channels disagree; inspect timing QC or use verified fixed timing")
+    if len(consensus_quality["channels_used"]) < n_ch:
+        logger.warning("Excluded weak timing references; consensus uses channels %s",
+                       [ch_names[i] for i in consensus_quality["channels_used"]])
     timing_quality = [{
         "channel": name,
         "sdur_mad_seconds": diag["sdur_mad"],
@@ -473,10 +498,6 @@ def run_pipeline(cfg: FARMConfig) -> dict:
 
     # Use scanner-locked repeatability of the timing band, not the largest
     # single excursion (which can be a muscle burst or a movement transient).
-    ref_ch, ref_scores = _select_reference_channel(
-        np.asarray([diag["ref_250"] for diag in timing_diags]),
-        vol_onsets, srate, cfg.tr,
-    )
     timing_ref_hf = np.asarray(timing_diags[ref_ch]["ref_250"], dtype=np.float32)
 
     info_table([
@@ -706,18 +727,40 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     t0 = time.time()
 
     # resample_poly supplies the anti-alias filtering needed for decimation.
-    # No analysis-band HPF/LPF is imposed here: the exported waveform remains
-    # the broadband FARM result.  This cleanly separates denoising from later
-    # EMG feature/regressor construction.
+    # Matched science filtering was applied once, before correction. No extra
+    # analysis-band filter is imposed during native-rate reconstruction.
     correction_native = downsample(
         data_up=data_science_up,
         srate_up=srate_up,
         factor=cfg.interp_factor,
         target_length=n_samples_orig,
     )
-    data_clean_crop = data_raw_trim - correction_native
+    data_clean_crop = data_native_science - correction_native
+    del data_native_science
     del correction_native
     del data_science_up, data_artifact_up
+
+    # Residual-line cleanup is an explicit experiment on the FARM waveform,
+    # before destructive masking and before the diagnostic QC band is applied.
+    line_reports = []
+    if cfg.line_cleanup != "off":
+        for ch, name in enumerate(ch_names):
+            farm_signal = data_clean_crop[ch].copy()
+            data_clean_crop[ch], line_report = clean_spectral_lines(
+                farm_signal, srate, reference=data_raw_trim[ch],
+                witness=data_raw_trim[(ch+1) % n_ch] if n_ch > 1 else None,
+                sdur=sdur, tr=observed_tr, **line_cleanup_options(cfg),
+            )
+            line_report["channel"] = name
+            line_report["witness_channel"] = ch_names[(ch+1) % n_ch] if n_ch > 1 else None
+            line_reports.append(line_report)
+            logger.info("Residual lines %s: %d eligible, %d corrected (%s)",
+                        name, line_report.get("eligible_line_count", 0),
+                        line_report["applied_line_count"], line_report["reason"])
+            if fig_dir is not None:
+                from farm.visualization.lines import plot_line_cleanup
+                plot_line_cleanup(farm_signal, data_clean_crop[ch], srate,
+                                  name, line_report, fig_dir)
 
     native_onsets = np.rint(onsets_up / cfg.interp_factor).astype(np.int64)
     native_stops = np.rint(
@@ -738,13 +781,12 @@ def run_pipeline(cfg: FARMConfig) -> dict:
     data_clean_full = data_full_raw.copy()
     data_clean_full[:, s_trim:e_trim] = data_clean_crop
 
-    # QC is intentionally performed in a configured EMG band, but this branch
-    # is diagnostic only and never replaces the exported broadband data.
+    # This diagnostic QC band never replaces the exported science branch.
     data_before_qc = apply_bandpass(data_raw_trim, srate, cfg.qc_bandpass)
     data_after_qc = apply_bandpass(data_clean_crop, srate, cfg.qc_bandpass)
 
     logger.info(
-        "Post-processing done in %.2f s — broadband FARM output preserved; "
+        "Post-processing done in %.2f s; "
         "QC evaluated at %.1f–%.1f Hz",
         time.time() - t0, cfg.qc_bandpass[0], cfg.qc_bandpass[1],
     )
@@ -841,7 +883,10 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "config": dict(cfg.__dict__),
         "input_vhdr": str(Path(cfg.vhdr_path).resolve()),
         "output_vhdr": brainvision_path,
-        "output_is_broadband_farm": True,
+        "output_is_broadband_farm": cfg.science_mode == "broadband",
+        "science_mode": cfg.science_mode,
+        "output_highpass_hz": cfg.artifact_hpf_cutoff if cfg.science_mode == "matched" else None,
+        "output_lowpass_hz": None,
         "selected_channels": ch_names,
         "sampling_rate_hz": srate,
         "tr_seconds": cfg.tr,
@@ -861,6 +906,9 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "initial_sdur_by_channel_seconds": initial_sdur_by_channel,
         "initial_dtime_by_channel_seconds": initial_dtime_by_channel,
         "timing_quality": timing_quality,
+        "timing_consensus_quality": consensus_quality,
+        "acquisition_qc": acquisition_qc,
+        "quality_status": "requires_review" if any(q.get("rail_samples", 0) for q in acquisition_qc) else "not_validated",
         "sdur_seconds": sdur,
         "dtime_seconds": dtime,
         "observed_tr_seconds": observed_tr,
@@ -871,7 +919,8 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "masked_intervals_samples_full": [[a+s_trim, b+s_trim] for a,b in masked_intervals],
         "masked_fraction_of_scan": sum(b-a for a,b in masked_intervals) / n_samples_orig,
         "science_time_grid_preserved": True,
-        "software_version": "1.2.0",
+        "software_version": __version__,
+        "line_cleanup": {"mode": cfg.line_cleanup, "channels": line_reports},
         "qc_bandpass_hz": cfg.qc_bandpass,
         "rms_reduction": rms_results,
         "scanner_locked_reduction": scanner_locked_results,
@@ -893,7 +942,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         ("Observed TR", f"{observed_tr * 1e3:.4f} ms"),
         ("Reconstructed TR", f"{reconstructed_tr * 1e3:.4f} ms"),
         ("Zero-filled gap fraction", f"{cfg.zero_fill_gap_fraction:.2f}"),
-        ("Exported signal", "broadband FARM (no regressor preprocessing)"),
+        ("Exported signal", f"FARM ({cfg.science_mode} science, no envelope/normalization)"),
         ("Total time", f"{time.time() - t_total:.1f} s"),
         ("Output", str(Path(cfg.output_dir).resolve())),
         ("Figures", str(fig_dir) if fig_dir else "disabled"),
@@ -925,6 +974,7 @@ def run_pipeline(cfg: FARMConfig) -> dict:
         "scanner_locked_results": scanner_locked_results,
         "harmonic_results": harmonic_results,
         "correction_diagnostics": correction_diagnostics,
+        "line_cleanup_reports": line_reports,
         "figures_dir": fig_dir,
         "output_dir": cfg.output_dir,
         "brainvision_path": brainvision_path,

@@ -13,6 +13,7 @@ import numpy as np
 from scipy import signal as sig
 
 from farm.config import FARMConfig
+from farm import __version__
 from farm.export.metadata import _jsonable
 from farm.diagnostics.metrics import compute_scanner_locked_reduction, compute_gradient_harmonic_reduction
 from farm.io.loader import load_brainvision, select_channels
@@ -20,6 +21,7 @@ from farm.io.triggers import detect_volume_onsets
 from farm.preprocessing.filters import hpf_fir
 from farm.preprocessing.resampling import upsample, downsample
 from farm.preprocessing.trim import trim_to_scan
+from farm.preprocessing.lines import clean_spectral_lines, line_cleanup_options, apply_line_plan
 from farm.timing.optimization import compute_slice_markers
 from farm.utils.slices import build_slice_info
 from farm.workflow import _correct_channel
@@ -55,9 +57,12 @@ def validate(cfg: FARMConfig, rms_uv: float = 20.0, seed: int = 201) -> dict:
         injected = (sig.sosfiltfilt(sos, rng.standard_normal(len(t))) * envelope).astype(np.float32)
         injected *= rms_uv * 1e-6 / np.sqrt(np.mean(injected**2))
         outputs = []
+        farm_outputs = []
+        line_reports = []
         for original in (data[channel], data[channel] + injected):
-            data_up, fs_up, vol_up = upsample(original[None, :], fs, volumes, cfg.interp_factor)
             reference = hpf_fir(original[None, :], fs, cfg.artifact_hpf_cutoff)
+            science = reference[0] if cfg.science_mode == "matched" else original
+            data_up, fs_up, vol_up = upsample(science[None, :], fs, volumes, cfg.interp_factor)
             ref_up, _, _ = upsample(reference, fs, volumes, cfg.interp_factor)
             markers, errors, length = compute_slice_markers(vol_up, sdur, gap, fs_up, cfg.n_sg)
             cleaned = _correct_channel(
@@ -67,7 +72,18 @@ def validate(cfg: FARMConfig, rms_uv: float = 20.0, seed: int = 201) -> dict:
             )
             correction = downsample((data_up[0]-cleaned)[None, :], fs_up,
                                     cfg.interp_factor, len(t))[0]
-            outputs.append(original - correction)
+            farm_output = science - correction
+            farm_outputs.append(farm_output)
+            if cfg.line_cleanup != "off":
+                output, line_report = clean_spectral_lines(
+                    farm_output, fs, reference=original,
+                    witness=data[(channel+1) % len(names)] if len(names)>1 else None, sdur=sdur,
+                    tr=cfg.tr, **line_cleanup_options(cfg),
+                )
+                line_reports.append(line_report)
+            else:
+                output = farm_output
+            outputs.append(output)
         recovered = outputs[1] - outputs[0]
         expected_env = np.sqrt(np.convolve(injected.astype(np.float64)**2, kernel, mode="same"))
         recovered_env = np.sqrt(np.convolve(recovered.astype(np.float64)**2, kernel, mode="same"))
@@ -86,7 +102,31 @@ def validate(cfg: FARMConfig, rms_uv: float = 20.0, seed: int = 201) -> dict:
                 cfg.qc_bandpass,
             )[0],
         })
-    return {"input_vhdr": str(Path(cfg.vhdr_path).resolve()), "n_volumes": count,
+        if cfg.line_cleanup != "off":
+            baseline = farm_outputs[1]-farm_outputs[0]
+            baseline_env = np.sqrt(np.convolve(baseline.astype(np.float64)**2, kernel, mode="same"))
+            results[-1]["without_line_cleanup"] = {
+                "gain": float(np.dot(baseline, injected)/np.dot(injected, injected)),
+                "relative_waveform_error": float(np.linalg.norm(baseline-injected)/np.linalg.norm(injected)),
+                "correlation": float(np.corrcoef(baseline, injected)[0, 1]),
+                "relative_envelope_error": float(np.linalg.norm(baseline_env-expected_env)/np.linalg.norm(expected_env)),
+            }
+            results[-1]["line_cleanup"] = {
+                "original": line_reports[0], "with_injection": line_reports[1],
+                "note": "Detection and filtering are re-estimated independently for each input.",
+            }
+            if cfg.line_cleanup in {"notch", "regress"}:
+                fixed = (apply_line_plan(farm_outputs[1], fs, line_reports[0]) -
+                         apply_line_plan(farm_outputs[0], fs, line_reports[0]))
+                fixed_env = np.sqrt(np.convolve(fixed.astype(np.float64)**2, kernel, mode="same"))
+                results[-1]["fixed_line_plan"] = {
+                    "gain": float(np.dot(fixed, injected)/np.dot(injected, injected)),
+                    "relative_waveform_error": float(np.linalg.norm(fixed-injected)/np.linalg.norm(injected)),
+                    "correlation": float(np.corrcoef(fixed, injected)[0, 1]),
+                    "relative_envelope_error": float(np.linalg.norm(fixed_env-expected_env)/np.linalg.norm(expected_env)),
+                    "note": "Same plan for both inputs; isolates filter effect from detector switching.",
+                }
+    return {"software_version": __version__, "input_vhdr": str(Path(cfg.vhdr_path).resolve()), "n_volumes": count,
             "sampling_rate_hz": fs, "injection_band_hz": [45, 220],
             "injection_rms_uv": rms_uv, "seed": seed,
             "config": dict(cfg.__dict__), "channels": results}
@@ -106,12 +146,20 @@ def main():
     parser.add_argument("--trigger", default="R128")
     parser.add_argument("--ch-regex", default="EXT|FLE")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--line-cleanup", choices=("off", "detect", "notch", "regress"), default="off")
+    parser.add_argument("--science-mode", choices=("matched", "broadband"), default="matched")
+    parser.add_argument("--line-max-count", type=int, default=12)
+    parser.add_argument("--line-min-prominence-db", type=float, default=8.0)
     args = parser.parse_args()
     cfg = FARMConfig(vhdr_path=args.vhdr, tr=args.tr, n_slices=args.n_slices,
                      mb_factor=args.mb_factor, timing_mode="fixed",
                      fixed_sdur_seconds=args.sdur_ms/1000, n_volumes=args.n_volumes,
                      pca_max_components=args.pca_max_components, figures_dir="",
                      trigger=args.trigger, ch_regex=args.ch_regex)
+    cfg.line_cleanup = args.line_cleanup
+    cfg.science_mode = args.science_mode
+    cfg.line_min_prominence_db = args.line_min_prominence_db
+    cfg.line_max_count = args.line_max_count
     result = validate(cfg, args.rms_uv, args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(_jsonable(result), indent=2, allow_nan=False) + "\n")

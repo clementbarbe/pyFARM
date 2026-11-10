@@ -1,90 +1,82 @@
-# Denoising method and scope
+# Denoising method
 
-This repository performs **artifact removal only**.  It intentionally stops
-before any physiological feature extraction or statistical modelling.
+The FARM-inspired core follows these stages:
 
-Core sequence:
+1. Load calibrated BrainVision channels and exact volume markers; retain complete
+   volumes and verify trigger intervals.
+2. Apply the same zero-phase FIR high-pass to science and artifact branches in
+   default `matched` mode.
+3. Estimate acquisition-group duration on each channel, combine reliable timing
+   references, and derive the inter-volume gap from the observed TR.
+4. Upsample working branches. Align padded segments for artifact estimation;
+   keep the science measurement on its original time grid.
+5. Select correlated neighboring occurrences of the same acquisition group.
+   Require agreement of disjoint candidate averages, use a trimmed mean and
+   bounded scaling, then inverse-shift artifact estimates before subtraction.
+6. Fit separate templates for the inter-volume gap.
+7. Perform section-wise residual PCA with artifact similarity gates. Subtract
+   only artifact-supported projections of eligible components and section means.
+8. Downsample the correction and subtract it from the native filtered science
+   branch. Optional line processing precedes explicit destructive gap masks.
+9. Replace the retained interval in selected channels of the full recording,
+   export BrainVision with rounded integer marker samples, and write QC/metadata.
 
-1. read BrainVision data and volume triggers;
-2. select EMG channels;
-3. crop an internal working copy to complete fMRI volumes;
-4. keep a broadband science branch while deriving an HPF artifact branch;
-5. estimate slice-group timing and refine `sdur`/`dtime`;
-6. upsample working branches and align padded artifact segments only;
-7. build adaptive same-slice-group templates from nearby volumes;
-8. undo artifact-template alignment and subtract on the original time grid;
-9. estimate separate templates for the inter-volume gap;
-10. remove only the artifact-supported part of eligible residual PCA components;
-11. downsample the correction and subtract it from the original native samples;
-    apply optional explicit gap masking after downsampling;
-12. replace the scan interval in the original full-length recording and export
-    BrainVision.
+The implementation is inspired by [van der Meer et al., 2010](https://doi.org/10.1016/j.clinph.2009.12.035).
+It differs from the original boundary-sample replacement and final analysis-band
+filtering. Matching science/template filtering prevents the systematic
+`(I-H) × artifact` residual of an unmatched `raw - H(artifact)` subtraction.
+The default high-pass attenuates physiological frequencies below its cutoff;
+no claim is made that the original broadband waveform is preserved.
 
-The output waveform is not normalized and is not forced into a 30–250 Hz
-analysis band.  The configured QC band is used only to quantify scanner
-artifact reduction and to make comparable before/after plots.
+## Residual lines: explicit experiment
 
-Inter-volume gaps can contain both scanner artifacts and useful EMG. Separate
-volume-gap templates are enabled by default. Zero filling is disabled by default;
-if explicitly selected, every removed interval is recorded in the sidecar.
-An improvement in the spectrum alone does not validate physiological preservation.
+The additional stage is disabled by default. Up to 64 independent Hann-windowed
+periodograms estimate a median spectrum. Local flanks provide a spectral floor.
+Default candidates must exceed it by 8 dB, have FWHM ≤0.5 Hz, appear in at least
+75% of sampled windows, and be supported in the original recording. Scanner/mains
+compatibility supports the existing notch mode; unrelated peaks are reported.
 
-## Downstream boundary
+The optional regression mode refines frequencies on the original-record Hann FFT.
+A persistent common-channel carrier can additionally be supported by harmonic
+structure in both original channels, or a detected harmonic family with
+volume-spaced sidebands. Original cross-channel magnitude-squared coherence
+must reach 0.8 at the carrier or a directly related harmonic independently
+present in both original channels. Coherence is evaluated at the exact refined
+frequencies using Hann-weighted projections, rather than interpolated from
+neighboring FFT bins. These heuristic criteria can also be
+met by physiological coherence/cross-talk and are not a significance test.
 
-The companion `emg-regressors` package owns all choices that are not denoising:
-analysis band, envelope, baseline/noise estimation, cross-run scaling, HRF, and
-SPM export.  Keeping this boundary prevents a change in statistical modelling
-from silently changing the denoised measurement.
+Correction confidence changes continuously near the prominence, persistence,
+width, original-reference and common-channel coherence gates. This limits
+discontinuities when small physiological changes move a candidate across a
+selection threshold. Confidence is empirical, not a probability.
 
+Each selected line is estimated by weighted sine/cosine regression in 32-s Hann
+windows with 75% overlap. Fits overlap-add on original samples; partial edge
+windows use measured data. Subtracting this estimate avoids imposing an entire
+fixed IIR stopband, but still suppresses nearby physiological components within
+the fit's effective bandwidth. Frequencies exactly matching a selected line
+cannot be assigned to artifact versus physiology by this model.
 
-## Timing stability
+Sliding sinusoidal regression is also used in established line-noise tools such
+as [EEGLAB CleanLine](https://eeglab.org/plugins/cleanline/). The present implementation
+uses Hann-weighted time-domain fits and its own evidence gates; it is **not** a
+reimplementation of CleanLine's multitaper/Thomson F-test procedure.
 
-Sequence timing is treated as a scanner/protocol parameter. The coarse timing
-estimator is applied per channel and per volume; medians are used to reduce
-contamination by voluntary EMG or motion. The default pipeline uses the
-channel-consensus estimate directly. Optional refinement is performed only on
-a scanner-dominated high-frequency reference and is restricted to a small
-local neighbourhood. A distant minimum of the periodic alignment cost is never
-accepted as a new physical sequence timing.
+Reports distinguish total selected-region power reduction from excess power over
+a local floor. If residual excess is zero, its reduction is undefined, rather
+than reported as an arbitrarily huge number of dB. All FFT comparisons use the
+same time interval and QC preprocessing; diagnostic figures never replace or
+rescale the exported waveform.
 
+## Practical limits
 
-## Preservation safeguards (v1.2)
-
-Template selection excludes the target occurrence, uses the same acquisition
-group in neighbouring volumes, and requires correlation >=0.8 by default. Two
-interleaved averages of selected candidates must also agree. Templates include
-context for inverse fractional alignment; their scaling is bounded to [0, 2]
-and their default average trims 10% of candidate values at each time sample.
-Rounded interval endpoints avoid sample holes and overlapping ownership.
-
-PCA is fitted per temporal section. Components must exceed the variance threshold
-and have strong artifact similarity (default 0.6). Only their projection onto the
-artifact-template subspace is subtracted, rather than an entire mixed component.
-Correction strength increases continuously above the similarity threshold,
-avoiding an abrupt full subtraction when a component barely passes.
-Mean removal requires stronger similarity (0.8) and repeatability. A component
-limit of zero disables this stage completely. These are empirical safeguards,
-not a mathematical guarantee that all physiological content is preserved.
-
-Timing uses a bounded coarse gap search (default 0–200 ms), normalized costs,
-and robust volume/channel medians. It does not constrain gaps to half a group.
-The high-pass used for timing is configurable, independent of the science branch.
-The optional local optimization remains restricted to the robust estimate's
-neighbourhood. Irregular triggers are rejected before correction.
-
-The output is built as `original_native - downsample(estimated_correction)`.
-Thus absence of correction preserves the original native samples, including
-content near the native Nyquist frequency. No final 30–250 Hz band is imposed.
-The template-estimation high-pass still limits which artifacts are modeled.
-
-The implementation is inspired by van der Meer et al. (2010),
-DOI: 10.1016/j.clinph.2009.12.035. It deliberately differs from the paper's
-replacement of volume-boundary samples and final analysis-band filtering.
-Independent EMG injection tests assess waveform/amplitude recovery alongside
-artifact rejection; scanner-locked or RMS reduction alone is not sufficient.
-
-
-BrainVision export uses pybv with explicitly rounded integer annotation samples
-and durations. This avoids one-sample shifts caused by floating-point truncation
-in a generic annotation-to-marker conversion. Channel data remain in their
-calibrated units, and original full-recording marker positions are retained.
+- Acquisition clipping destroys information before correction and requires
+  temporal/channel-level review. Its absence does not validate physiology.
+- Template/PCA similarity and spectral coherence are empirical safeguards.
+  Scanner-synchronous EMG remains intrinsically difficult to distinguish.
+- Large RMS/line reductions alone do not prove useful EMG preservation.
+- Independent injection tests assess a controlled family of signals, not all
+  physiological activity. Adaptive and fixed-plan recovery distinguish detector
+  switching from the effect of a selected filter/regression plan.
+- There is no universal QC acceptance threshold or automatically validated channel.

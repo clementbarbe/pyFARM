@@ -36,8 +36,12 @@ class FARMConfig:
     time_section: float = 60.0
     var_threshold: float = 5.0
 
-    # Artifact / timing branches; neither replaces the science measurement.
+    # Artifact/timing branches and explicitly matched science preprocessing.
     artifact_hpf_cutoff: float = 30.0
+    # Match the science and template transfer functions. Subtracting H(artifact)
+    # from an unfiltered measurement leaves (I-H)(artifact), even in the QC band.
+    # 'broadband' retains the historical output only for explicit comparisons.
+    science_mode: str = "matched"
     timing_hpf_cutoff: float = 30.0
     timing_reference_hpf: float = 250.0
     # Coarse search is bounded by the sequence, not an arbitrary half-group.
@@ -70,6 +74,17 @@ class FARMConfig:
 
     # Explicit destructive masking only. Prefer dedicated gap templates.
     zero_fill_gap_fraction: float = 0.0
+
+    # Optional residual-line experiment. No change to exported samples unless
+    # explicitly enabled with 'notch'; 'detect' reports candidates only.
+    line_cleanup: str = "off"
+    line_band: Tuple[float, float] = (30.0, 250.0)
+    line_min_prominence_db: float = 8.0
+    line_max_width_hz: float = 0.5
+    line_min_persistence: float = 0.75
+    line_max_count: int = 12
+    line_window_seconds: float = 8.0
+    line_regression_window_seconds: float = 32.0
 
     # QC band only.  It NEVER modifies the exported denoised waveform.
     qc_bandpass: Tuple[float, float] = (30.0, 250.0)
@@ -121,6 +136,8 @@ class FARMConfig:
             raise ValueError("n_candidates must be >= 2 for disjoint template averages")
         if self.time_section <= 0:
             raise ValueError("time_section must be positive")
+        if self.science_mode not in {"matched", "broadband"}:
+            raise ValueError("science_mode must be matched or broadband")
         if self.n_volumes is not None and self.n_volumes < 2:
             raise ValueError("n_volumes must be >= 2")
         if self.timing_max_gap_seconds <= 0 or self.timing_max_gap_seconds >= self.tr:
@@ -160,6 +177,21 @@ class FARMConfig:
             raise ValueError("padding must be >= 0")
         if not (0.0 <= self.zero_fill_gap_fraction <= 1.0):
             raise ValueError("zero_fill_gap_fraction must be in [0, 1]")
+        if self.line_cleanup not in {"off", "detect", "notch", "regress"}:
+            raise ValueError("line_cleanup must be off, detect, notch or regress")
+        if not (0 < self.line_band[0] < self.line_band[1]):
+            raise ValueError("line_band must have 0 < low < high")
+        for name in ("line_min_prominence_db", "line_max_width_hz"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 0 < self.line_min_persistence <= 1:
+            raise ValueError("line_min_persistence must be in (0, 1]")
+        if self.line_max_count < 1:
+            raise ValueError("line_max_count must be >= 1")
+        if not math.isfinite(self.line_regression_window_seconds) or self.line_regression_window_seconds < 16:
+            raise ValueError("line_regression_window_seconds must be >= 16")
+        if not math.isfinite(self.line_window_seconds) or self.line_window_seconds < 4:
+            raise ValueError("line_window_seconds must be >= 4")
         if len(self.qc_bandpass) != 2 or not (
             0.0 < self.qc_bandpass[0] < self.qc_bandpass[1]
         ):
@@ -171,6 +203,8 @@ class FARMConfig:
         if srate <= 0:
             raise ValueError(f"Invalid sampling rate: {srate}")
         nyquist = srate / 2.0
+        if self.line_cleanup != "off" and not self.line_band[1] < nyquist:
+            raise ValueError("line_band high must be below Nyquist")
         for name, freq in {
             "artifact_hpf_cutoff": self.artifact_hpf_cutoff,
             "timing_hpf_cutoff": self.timing_hpf_cutoff,
